@@ -1,0 +1,11 @@
+# Frontend & Automation Agent
+# Used by: session_ui.py, agent.py
+# Install: pip install -r requirements_frontend.txt
+
+fastapi
+uvicorn
+pydantic
+python-multipart
+requests
+playwright
+openai

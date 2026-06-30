@@ -1,0 +1,15 @@
+# AI Vision Backend
+# Used by: api.py, gemma.py, vllm.sh
+# Install: pip install -r requirements_backend.txt
+# Note: Requires ~64GB+ VRAM to run google/gemma-4-31b-it in bfloat16
+#
+
+
+vllm
+openai
+torch
+opencv-python
+Pillow
+pyzbar
+qreader
+opencc
