@@ -220,18 +220,25 @@ def open_plan_expense_page(page: Page) -> str:
 
 def submit_project_code(page: Page, project_code: str) -> str:
     try:
-        # 1. Target the visible text input, explicitly ignoring the hidden one
-        input_box = page.locator("input[type='text'][name='bugetno']")
+        # 1. Search all frames for the bugetno input (NTU uses frame layouts)
+        target_frame = None
+        input_box = None
+        for frame in page.frames:
+            box = frame.locator("input[type='text'][name='bugetno']")
+            if box.count() > 0:
+                target_frame = frame
+                input_box = box
+                break
             
-        if input_box.count() > 0:
+        if target_frame and input_box:
             # Fail fast if obscured, instead of hanging for 30s
             input_box.first.click(timeout=5000) 
             time.sleep(0.3) # Allow legacy JS to clear the fake placeholder
             input_box.first.clear()
             input_box.first.fill(project_code)
 
-            # 2. Target the exact submit button
-            submit_btn = page.locator("input[type='submit'][name='act'][value='報帳']")
+            # 2. Target the exact submit button in the same frame
+            submit_btn = target_frame.locator("input[type='submit'][name='act'][value='報帳']")
 
             if submit_btn.count() > 0:
                 # 3. State-Based Waiting (Navigation Safe)
@@ -551,15 +558,19 @@ def add_payee(page: Page, payee_id: str, note: str, amount: str, payee: dict = N
 
 
 def print_receipt(page: Page) -> str:
-    """Finalizes the workflow."""
+    """Extracts the ASN from the 列印黏存單 form and stores the print page URL."""
     try:
         for frame in page.frames:
-            print_btn = frame.locator("input[value*='列印黏存單'], button:has-text('列印黏存單')")
-            if print_btn.count() > 0:
-                print_btn.first.click()
-                page.wait_for_load_state("networkidle")
-                return "OK - Receipt printed."
-        return "ERROR: Could not find '列印黏存單' button."
+            # Try to extract ASN from the hidden input in the print form
+            asn_input = frame.locator("form[action*='printmain'] input[name='asn'], form:has(input[value='列印黏存單']) input[name='asn']")
+            if asn_input.count() > 0:
+                asn = asn_input.first.get_attribute("value")
+                if asn:
+                    print_url = f"https://ntuacc.cc.ntu.edu.tw/acc/apply/printatt.asp?asn={asn}"
+                    _state["print_url"] = print_url
+                    print(f"🖨️ Print URL: {print_url}")
+                    return f"OK - ASN={asn}, print URL saved."
+        return "ERROR: Could not find ASN for print page."
     except Exception as e:
         return f"ERROR in print_receipt: {e}"
 
@@ -758,19 +769,20 @@ def auto_login(page: Page, cfg: dict) -> None:
 
 
 # 修改原有的 run_submission 函數
-def run_submission(cfg: dict, payee: dict, invoices: list, headless: bool = False) -> str:
+def run_submission(cfg: dict, payee: dict, invoices: list, headless: bool = True) -> str:
     llm = OpenAI(base_url=cfg["agent_base_url"], api_key="not-needed")
     
     # Close any existing global session if running multiple times
     close_browser()
     
     pw = sync_playwright().start()
-    browser = pw.chromium.launch(headless=headless)
-    page = browser.new_context().new_page()
+    browser = pw.chromium.launch(headless=True)
+    context = browser.new_context()
+    page = context.new_page()
     
     _state["pw"], _state["browser"], _state["page"] = pw, browser, page
 
-    print("🌐 Opening NTU accounting system...")
+    print("🌐 Opening NTU accounting system (background)...")
     
     # --- 替換掉原本的手動輸入，改為自動登入 ---
     auto_login(page, cfg)
@@ -780,10 +792,26 @@ def run_submission(cfg: dict, payee: dict, invoices: list, headless: bool = Fals
     _save_audit_log(report_number, invoices, payee)
 
     if report_number:
-        print("✅ Agent finished successfully. Leaving browser open for printing.")
-        # close_browser() 
+        print_url = _state.get("print_url")
+        if print_url:
+            # Save session state, close headless, open visible browser to print page
+            storage = context.storage_state()
+            browser.close()
+            
+            print("🖨️ Opening print page...")
+            visible_browser = pw.chromium.launch(headless=False)
+            visible_context = visible_browser.new_context(storage_state=storage)
+            visible_page = visible_context.new_page()
+            visible_page.goto(print_url)
+            visible_page.wait_for_load_state("networkidle")
+            
+            _state["browser"], _state["page"] = visible_browser, visible_page
+            print("✅ Agent finished. Print page is open.")
+        else:
+            print("✅ Agent finished. No print URL found.")
+            close_browser()
     else:
-        print("⚠️ Agent failed. Leaving browser open for debugging.")
+        print("⚠️ Agent failed.")
 
     return report_number
 

@@ -1,4 +1,4 @@
-# NTU Invoice Agent System
+# NTU Invoice Agent System — 希望
 
 An intelligent, hybrid automation tool designed to streamline the invoice submission process for the legacy NTU Accounting System. By combining an intuitive web frontend, an advanced local Vision AI backend powered by vLLM, and a headless browser automation agent, this project drastically cuts down manual data entry and ensures high accuracy.
 
@@ -11,36 +11,45 @@ An intelligent, hybrid automation tool designed to streamline the invoice submis
 4. [Installation & Setup](#installation--setup)
 5. [Usage Guide](#usage-guide)
 6. [AI Backend & OCR Workflow](#ai-backend--ocr-workflow)
-7. [API Reference](#api-reference)
 
 ---
 
 ## 🏛️ Architecture Overview
 This system operates across three distinct layers:
-1. **Frontend UI (`session_ui.py`)**: A modern HTML/JS interface running locally (Port 8000). It acts as the data-collection hub, handling image uploads, live camera feeds, and user review of OCR data.
-2. **AI Vision Backend (`vllm.sh`, `api.py`, `gemma.py`)**: A local AI extraction pipeline. It runs the powerful `google/gemma-4-31b-it` model via vLLM (Port 8000/8080) to classify invoices, decode QR codes, and intelligently extract line items.
-3. **Execution Agent (`agent.py`)**: A Python-based Playwright script that spins up a Chromium browser, securely injects credentials, and mimics human interaction to navigate the NTU accounting system and submit the data.
+1. **Frontend UI (`session_ui.py`)**: A modern HTML/JS PWA interface running locally (Port 8001). Features a「希望」landing page, handles image uploads, live camera feeds, editable OCR review, and automatic amount capping.
+2. **AI Vision Backend (`vllm.sh`, `api.py`, `gemma.py`)**: A local AI extraction pipeline. It runs the powerful `google/gemma-4-31b-it` model via vLLM to classify invoices, decode QR codes, and intelligently extract line items.
+3. **Execution Agent (`agent.py`)**: A Python-based Playwright script that runs Chromium in **headless mode**, securely injects credentials, navigates the NTU accounting system, submits data, and opens the final print page (`printatt.asp`) in a visible browser for printing.
 
 ---
 
 ## ✨ Key Features
-- **Local AI OCR (Gemma 4)**: Uses a local vLLM instance to run `gemma-4-31b-it` for highly accurate, private invoice extraction. No cloud APIs required!
+- **PWA Landing Page**: A beautiful「希望」branded landing page — installable as a home screen app on any device.
+- **Local AI OCR (Gemma 4)**: Uses a local vLLM instance to run `gemma-4-31b-it` for highly accurate, private invoice extraction. No cloud APIs required.
 - **Hybrid QR Validation**: Automatically detects Taiwan e-invoices, scans the embedded QR code for 100% accurate totals and dates, and merges it with the AI's itemized extraction.
 - **Live Document Camera**: Hot-swap between laptop webcams and external USB Document Cameras (實物攝影機) natively in the browser.
+- **Editable OCR Items**: All extracted line items (品名/數量/單價) are fully editable with add/remove row support before submission.
+- **Automatic Amount Capping**: Amounts exceeding NT$2,000 are automatically capped to 2,000.
+- **Smart Invoice Numbers**: When the OCR cannot find an invoice number (`NOT FOUND`), it auto-generates one using ROC date format (e.g. `1150703` for 2026/07/03).
+- **Headless Automation**: The browser runs entirely in the background — users never see the automation process. Only the final print page (`printatt.asp`) is opened in a visible browser.
 - **Legacy System Bypassing**: Automatically navigates heavily-framed legacy DOMs, using raw JavaScript injection to bypass `readonly` fields.
-- **Zero-Trace Data Wiping**: Clicking "Wipe" permanently zeros-out and deletes all local JSON session files.
+- **Zero-Trace Data Wiping**: Clicking "Wipe" permanently zeros-out and deletes all local JSON, images, and PDF files.
 
 ---
 
 ## ⚙️ Prerequisites
-Running a 31B parameter Vision model locally natively in `bfloat16` is highly resource-intensive. Ensure your system meets the following specifications:
+Running a 31B parameter Vision model locally in `bfloat16` is highly resource-intensive. Ensure your system meets the following specifications:
 
-**Hardware Requirements (AI Backend):**
+**Hardware Requirements (AI Backend — Full Precision BF16):**
 - **GPU**: At least ~64GB+ of total VRAM is required to load the model weights and KV cache.
   - *Recommended Setup*: 2x NVIDIA RTX A6000 (48GB), or 1x NVIDIA A100/H100 (80GB).
-  - *Alternative Setup*: Mac Studio with M2/M3 Ultra (128GB+ Unified Memory) using MLX/vLLM Apple Silicon support (requires configuration adjustments).
+  - *Alternative Setup*: Mac Studio with M2/M3 Ultra (128GB+ Unified Memory).
 - **RAM**: 64GB+ System RAM.
 - **Storage**: 100GB+ fast NVMe SSD storage for model weights.
+
+**Hardware Requirements (AI Backend — INT4 AWQ Quantized):**
+- **GPU**: A single NVIDIA RTX 5090 (32GB) or RTX 4090 (24GB) is sufficient.
+  - Model weights: ~16GB, leaving ample room for KV cache.
+  - Quality loss is <3% and negligible for structured OCR tasks.
 
 **Software Requirements:**
 - **OS**: Linux (Ubuntu 20.04/22.04 recommended) or macOS (Apple Silicon).
@@ -53,7 +62,7 @@ Running a 31B parameter Vision model locally natively in `bfloat16` is highly re
 ## 🚀 Installation & Setup
 
 ### 0. Create Conda Environment
-We recommend using Conda with Python 3.11 to manage frontend and backend all dependencies cleanly, you can create 1 for each if needed:
+We recommend using Conda with Python 3.11 to manage all dependencies cleanly. You can create one environment for each component if needed:
 ```bash
 conda create -n invoice_agent python=3.11 -y
 conda activate invoice_agent
@@ -87,32 +96,46 @@ pip install -r requirements.txt
 - `opencc`: Performs Simplified to Traditional Chinese text conversion.
 - `openai`: Used as a standard client to communicate with the local `vLLM` server.
 
-3. **Configure Credentials**
-   Create `config.json`:
-   ```json
-   {
-       "ntu_username": "YOUR_NTU_ID",
-       "ntu_password": "YOUR_NTU_PASSWORD",
-       "agent_base_url": "YOUR_AGENT_URL_IF_NEEDED",
-       "project_code": "114L3073",
-       "expense_type": "教材費(書籍)"
-   }
-   ```
+### 2. Configure Credentials
+Create `frontend/config.json`:
+```json
+{
+    "ntu_username": "YOUR_NTU_ID",
+    "ntu_password": "YOUR_NTU_PASSWORD",
+    "agent_base_url": "YOUR_AGENT_URL_IF_NEEDED",
+    "project_code": "114L3073",
+    "expense_type": "教材費(書籍)"
+}
+```
 
-3. **Start the AI Vision Backend**
-   Launch the vLLM server:
-   ```bash
-   ./vllm.sh
-   ```
-   *Wait for the model weights to load into VRAM.* Then start the extraction API:
-   ```bash
-   python api.py
-   ```
+### 3. Start the AI Vision Backend
+Launch the vLLM server:
+```bash
+cd backend
+bash vllm.sh
+```
+*Wait for the model weights to load into VRAM.* Then start the extraction API:
+```bash
+python api.py
+```
 
-4. **Start the Web UI**
-   ```bash
-   python session_ui.py
-   ```
+For **RTX 5090 (32GB)** users, use INT4 AWQ quantization:
+```bash
+VLLM_ATTENTION_BACKEND=TORCH_SDPA \
+python -m vllm.entrypoints.openai.api_server \
+    --model google/gemma-4-31b-it-awq \
+    --port 8000 \
+    --dtype auto \
+    --quantization awq \
+    --max-model-len 8192 \
+    --trust-remote-code
+```
+
+### 4. Start the Web UI
+```bash
+cd frontend
+python session_ui.py
+```
 
 ---
 
@@ -126,9 +149,9 @@ The OCR pipeline is explicitly designed for Taiwan's complex receipt landscape:
 ---
 
 ## 📝 Usage Guide
-1. Open `http://localhost:8001`.
-2. **Step 1**: Enter the Payee Information (ID, Bank Code, Account Number).
-3. **Step 2**: Click **"📷 使用電腦相機拍照"** to snap a photo of your receipt using a document camera.
-4. **Step 3**: The local Gemma backend processes the image. Review and confirm the extracted data.
-5. **Step 4**: Click **Execute**. The Playwright agent will automatically log into the NTU portal and submit everything.
-6. **Step 5**: Print your physical copies and click **Wipe Data** to securely erase your session.
+1. Open `http://localhost:8001` — tap the「希望」icon to enter the app.
+2. **Step 1**: Enter the Payee Information (ID, Name, Bank Code, Account Number).
+3. **Step 2**: Click **"📷 使用電腦相機拍照"** to snap a photo of your receipt, or drag-and-drop an image.
+4. **Step 3**: Review and edit the extracted data. Items are fully editable. Amounts over NT$2,000 are auto-capped. Invoices without a number auto-generate a ROC date format number.
+5. **Step 4**: Click **Execute**. The Playwright agent runs in the background (headless). Upon completion, the NTU print page (`printatt.asp`) opens in a visible browser — press **Ctrl+P** to print.
+6. **Step 5**: After printing, click **Wipe Data** to securely erase all personal data from the device.

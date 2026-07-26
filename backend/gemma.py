@@ -34,7 +34,7 @@ COMMON_RULES = """
      * 參考範例 1：「壹萬伍仟柒佰伍拾元整」 -> 15750
      * 參考範例 2：「參仟貳佰元整」 -> 3200
      * 參考範例 3：「捌佰零伍元」 -> 805
-8. buyer_UBN (買方統編):
+8. UBN (買方統編):
    - 請尋找畫面上的「買方統編」或「買受人統編」。
    - 如果有找到 8 位數字，請精準提取 (基本上是 "03734301")。
    - 如果畫面上完全沒有印買方統編，或者統編空白，請輸出 "NOT FOUND"。
@@ -57,7 +57,7 @@ PROMPTS = {
            - ⚠️ 【視覺防呆 - 尾部】：發票金額常以橫線結尾 (如 146.- 或 113.-)，請絕對忽略尾部的「-」或「元」，千萬不可以把它們當成「0」！(例如 2146.- 就是 2146，不是 21460)。
            - ⚠️ 【視覺防呆 - 頭部】：如果數字開頭帶有金錢符號「$」，絕對不可以誤認為數字「5」！(例如 $600 就是 600，不是 5600)。
            - 【邏輯驗證】：請確認你抓取的總計金額，必須「大於或等於」單一品項的價格。若無國字大寫，請尋找「總計」或「含稅」旁邊的最大數字。只能輸出純數字字串。
-4. buyer_UBN (買方統編): 買方統編基本上為 "03734301"。
+4. UBN (買方統編): 買方統編基本上為 "03734301"。
 5. items (品項列表): 請盡可能辨識手寫品名。""" + COMMON_RULES,
 
     "einvoice": """這是一張台灣的電子發票。請嚴格遵守以下規則提取資訊：
@@ -65,7 +65,7 @@ PROMPTS = {
 1. invoice_number (發票號碼): 2 個大寫英文字母 + 8 個數字。嚴禁抓取任何手寫號碼。
 2. date (交易日期): 西元格式 YYYY-MM-DD。
 3. total_amount (總計金額): 尋找印刷的「總計」。絕對封鎖手寫字。
-4. buyer_UBN (買方統編): 買方統編基本上為 "03734301"。
+4. UBN (買方統編): 買方統編基本上為 "03734301"。
 5. items (品項列表): 書名通常很長且包含英文與特殊符號，請完整複製。""" + COMMON_RULES,
 
     "old": """這是一張台灣的傳統發票/收據。請按照以下規則提取資訊，輸出為完整的 JSON 格式。
@@ -83,7 +83,7 @@ PROMPTS = {
 class HighFidelityInvoiceAgent:
     def __init__(self):
         # 🎯 重要：修改為 vLLM 伺服器正在對外提供服務的確切模型名稱
-        self.model_id = "google/gemma-4-31b-it" 
+        self.model_id = "cyankiwi/gemma-4-31B-it-AWQ-4bit" 
         
         # 🎯 重要：修改為您轉發的 vLLM 連接埠 (通常為 8080 或 8081)
         vllm_port = 8080 
@@ -190,15 +190,15 @@ def scan_taiwan_einvoice_qr(image_path):
                 
                 # --- NEW CODE HERE ---
                 # Extract Buyer UBN. If it's all zeros, it means no UBN was given.
-                raw_buyer_ubn = qr_text[53:61].strip()
-                buyer_ubn = "NOT FOUND" if raw_buyer_ubn == "00000000" else raw_buyer_ubn
+                raw_UBN = qr_text[53:61].strip()
+                UBN = "NOT FOUND" if raw_UBN == "00000000" else raw_UBN
                 
                 return {
                     "invoice_number": qr_text[0:10],
                     "date": f"{west_year}-{month}-{day}",
                     "total_amount": str(int(qr_text[29:37], 16)),
                     "seller_UBN": qr_text[45:53],
-                    "buyer_UBN": buyer_ubn # <-- Add this to the return dictionary
+                    "UBN": UBN # <-- Add this to the return dictionary
                 }
                 
     except Exception as e:
@@ -233,7 +233,7 @@ def validate_and_clean_data(invoice_data):
 # ==========================================
 if __name__ == "__main__":
     SOURCE_FOLDER = "./invoices"       
-    OUTPUT_FOLDER = "./invoices_gemmas3"  
+    OUTPUT_FOLDER = "./invoices_gemmas9"  
     
     if not os.path.exists(SOURCE_FOLDER):
         print(f"❌ 錯誤：找不到來源資料夾 {SOURCE_FOLDER}。請創建並放入圖片。")

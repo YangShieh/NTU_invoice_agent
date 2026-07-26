@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Session & temp data
+session.json
+session_image.jpg
+*.png
+
+# Credentials (NEVER commit)
+config.json
+
+# Audit logs
+audit_*.json
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

@@ -12,7 +12,7 @@ Open: http://localhost:8001
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 import uvicorn, json, os, shutil, requests, time
 from pydantic import BaseModel
 
@@ -21,6 +21,32 @@ TEMP_IMAGE   = "session_image.jpg"
 CONFIG_FILE  = "config.json"
 
 app = FastAPI()
+
+@app.get("/favicon.ico")
+def favicon():
+    svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#1a237e"/><stop offset="100%" stop-color="#00897b"/></linearGradient></defs><rect width="512" height="512" rx="80" fill="url(#bg)"/><text x="256" y="300" text-anchor="middle" font-size="200" font-family="serif" fill="white" font-weight="bold">希望</text></svg>'
+    return Response(content=svg, media_type="image/svg+xml")
+
+@app.get("/icon-512.svg")
+def app_icon():
+    svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#1a237e"/><stop offset="100%" stop-color="#00897b"/></linearGradient></defs><rect width="512" height="512" rx="80" fill="url(#bg)"/><text x="256" y="300" text-anchor="middle" font-size="200" font-family="serif" fill="white" font-weight="bold">希望</text></svg>'
+    return Response(content=svg, media_type="image/svg+xml")
+
+@app.get("/manifest.json")
+def manifest():
+    m = {
+        "name": "希望 - 報帳助理",
+        "short_name": "希望",
+        "description": "NTU 智慧報帳系統",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#f5f5f0",
+        "theme_color": "#1a237e",
+        "icons": [
+            {"src": "/icon-512.svg", "sizes": "512x512", "type": "image/svg+xml", "purpose": "any maskable"}
+        ]
+    }
+    return Response(content=json.dumps(m), media_type="application/manifest+json")
 
 def load_config() -> dict:
     with open(CONFIG_FILE, encoding="utf-8") as f:
@@ -38,7 +64,7 @@ def save_session(data: dict):
 
 def wipe_session():
     """Remove all personal data from disk."""
-    for path in [SESSION_FILE, TEMP_IMAGE]:
+    for path in [SESSION_FILE, TEMP_IMAGE, "print_page.pdf"]:
         if os.path.exists(path):
             # Overwrite with zeros before deleting (basic privacy)
             with open(path, "wb") as f:
@@ -152,6 +178,15 @@ def close_browser_endpoint():
     close_browser()
     return {"ok": True}
 
+@app.get("/api/print-page")
+def get_print_page():
+    """Serve the captured PDF of the final print page."""
+    from fastapi.responses import FileResponse
+    pdf_path = os.path.join(os.path.dirname(__file__), "print_page.pdf")
+    if os.path.exists(pdf_path):
+        return FileResponse(pdf_path, media_type="application/pdf", filename="報帳點収單.pdf")
+    raise HTTPException(404, "尚未產生列印頁面")
+
 @app.post("/api/wipe")
 def wipe_endpoint():
     """User confirms completion — wipe all personal data."""
@@ -178,6 +213,42 @@ def get_session():
 # ── Single-page UI ────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
+def landing():
+    return r"""<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="希望">
+<meta name="theme-color" content="#1a237e">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon-512.svg">
+<title>希望</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:linear-gradient(135deg,#1a237e 0%,#00897b 100%)}
+.landing{text-align:center;animation:fadeIn .8s ease}
+.icon-btn{display:inline-flex;align-items:center;justify-content:center;width:180px;height:180px;border-radius:40px;background:rgba(255,255,255,0.15);backdrop-filter:blur(20px);border:2px solid rgba(255,255,255,0.3);cursor:pointer;transition:all .3s ease;text-decoration:none;box-shadow:0 20px 60px rgba(0,0,0,0.3)}
+.icon-btn:hover{transform:scale(1.08);background:rgba(255,255,255,0.25);box-shadow:0 25px 70px rgba(0,0,0,0.4)}
+.icon-btn:active{transform:scale(0.96)}
+.icon-text{font-size:64px;font-weight:bold;color:white;font-family:serif}
+.label{color:rgba(255,255,255,0.9);font-size:16px;margin-top:24px;font-weight:500;letter-spacing:2px}
+.sublabel{color:rgba(255,255,255,0.5);font-size:12px;margin-top:8px}
+@keyframes fadeIn{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+</style>
+</head>
+<body>
+<div class="landing">
+  <a href="/app" class="icon-btn"><span class="icon-text">希望</span></a>
+  <p class="label">NTU 報帳助理</p>
+  <p class="sublabel">點擊開始</p>
+</div>
+</body>
+</html>
+"""
+
+@app.get("/app", response_class=HTMLResponse)
 def ui():
     # Clear any previous session invoices on page refresh
     session = load_session()
@@ -191,7 +262,12 @@ def ui():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>報帳助理</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="希望">
+<meta name="theme-color" content="#1a237e">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon-512.svg">
+<title>希望 - 報帳助理</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:system-ui,sans-serif;background:#f5f5f0;color:#1a1a1a;padding:20px;max-width:640px;margin:0 auto}
@@ -327,7 +403,8 @@ textarea{resize:vertical;min-height:50px}
 <div class="card locked" id="card-done">
   <h2><span class="step-badge" id="badge-5">5</span>完成確認 &amp; 資料清除</h2>
   <p style="font-size:13px;color:#555">報帳條碼：<strong id="report-number">—</strong></p>
-  <p style="font-size:13px;color:#555;margin-top:6px">請確認列印黏存單已完成，然後點下方按鈕清除本機所有個人資料。</p>
+  <p id="print-msg" style="font-size:13px;color:#16a34a;margin-top:8px;display:none">🖨️ 列印黏存單頁面已在瀏覽器中開啟，請直接列印。</p>
+  <p style="font-size:13px;color:#555;margin-top:10px">請確認列印黏存單已完成，然後點下方按鈕清除本機所有個人資料。</p>
   <div class="btn-row">
     <button class="btn btn-danger" onclick="wipeData()">確認完成，立即清除個人資料</button>
   </div>
@@ -472,14 +549,21 @@ function populateReview(d) {
   let invNum = d.invoice_number || '';
   const dateVal = d.date || '';
   if (invNum.replace(/\s/g, '').toUpperCase() === 'NOTFOUND' || invNum === '') {
-    // Generate: date digits only + "/" + sequential number
-    const dateDigits = dateVal.replace(/[^0-9]/g, '');
-    const count = parseInt(document.getElementById('inv-count').textContent || '0') + 1;
-    invNum = dateDigits + '/' + count;
+    // Generate ROC date: (year-1911)MMDD
+    const parts = dateVal.split('-');
+    if (parts.length === 3) {
+      const rocYear = parseInt(parts[0]) - 1911;
+      invNum = rocYear + parts[1] + parts[2];
+    } else {
+      invNum = dateVal.replace(/[^0-9]/g, '');
+    }
   }
   document.getElementById('r-invnum').value = invNum;
   document.getElementById('r-date').value = dateVal;
-  document.getElementById('r-amount').value = d.total_amount || '';
+  // Cap amount at 2000
+  let amount = parseInt(d.total_amount) || 0;
+  if (amount > 2000) amount = 2000;
+  document.getElementById('r-amount').value = amount || d.total_amount || '';
   document.getElementById('r-purpose').value = d.expense_purpose || '';
 
   const tbody = document.getElementById('items-body');
@@ -536,7 +620,8 @@ function addAnotherInvoice() {
   document.getElementById('invoice-actions').style.display = 'none';
   setMsg('msg-review', '', '');
   resetOcr();
-  document.getElementById('file-input').click();
+  // Scroll to Step 2 upload card instead of opening file dialog
+  document.getElementById('card-upload').scrollIntoView({ behavior: 'smooth' });
 }
 
 function finishInvoices() {
@@ -560,6 +645,7 @@ async function runAgent() {
     document.getElementById('report-number').textContent = data.report_number || '（請查看瀏覽器視窗）';
     document.getElementById('msg-agent').className = 'msg ok';
     document.getElementById('msg-agent').textContent = 'Agent 完成！';
+    document.getElementById('print-msg').style.display = 'block';
     markDone(4);
     unlock('card-done');
   } else {
