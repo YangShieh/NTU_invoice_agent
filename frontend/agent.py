@@ -363,10 +363,14 @@ def add_payee(page: Page, payee_id: str, note: str, amount: str, payee: dict = N
             page.wait_for_load_state("networkidle", timeout=5000)
             time.sleep(1.0)
 
-        # --- 2. 切換至「匯款」以觸發可能的畫面更新 ---
+        # --- 2. 選擇「匯代墊人」付款方式 ---
         try:
-            page.locator("select").first.select_option(label="匯款")
-            time.sleep(0.5)
+            for frame in page.frames:
+                paymethod = frame.locator("select[name='paymethod'], select#paymethod")
+                if paymethod.count() > 0:
+                    paymethod.first.select_option(value="匯代墊人")
+                    time.sleep(0.5)
+                    break
         except:
             pass
 

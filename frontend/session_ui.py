@@ -240,7 +240,7 @@ body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-co
 </head>
 <body>
 <div class="landing">
-  <a href="/app" class="icon-btn"><span class="icon-text">希望</span></a>
+  <a href="/invoice_wish" class="icon-btn"><span class="icon-text">希望</span></a>
   <p class="label">NTU 報帳助理</p>
   <p class="sublabel">點擊開始</p>
 </div>
@@ -248,7 +248,7 @@ body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-co
 </html>
 """
 
-@app.get("/app", response_class=HTMLResponse)
+@app.get("/invoice_wish", response_class=HTMLResponse)
 def ui():
     # Clear any previous session invoices on page refresh
     session = load_session()
