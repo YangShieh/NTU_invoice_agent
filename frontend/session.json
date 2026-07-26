@@ -1,1 +1,9 @@
-{}
+{
+  "payee": {
+    "payee_id": "H126068439",
+    "payee_name": "謝政洋",
+    "bank_code": "700",
+    "account_number": "00013750605168"
+  },
+  "step": "payee_saved"
+}

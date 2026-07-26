@@ -25,14 +25,14 @@ The architecture operates via three distinct layers communicating asynchronously
 To prevent data leakage to external cloud APIs, the system hosts its own state-of-the-art vision extraction pipeline natively on-premise.
 
 **Hardware & Resource Profile:**
-Running a 31-Billion parameter Vision model locally is a demanding workload. Two deployment options are supported:
+With INT4 AWQ quantization, the 31B model runs on a single consumer GPU:
 
 | Mode | VRAM Required | GPU Examples |
 |---|---|---|
+| INT4 AWQ (Recommended) | ~23GB | 1x RTX 5090, 1x RTX 4090 |
 | BF16 (Full Precision) | ~64GB+ | 2x A6000, 1x A100/H100 |
-| INT4 AWQ (Quantized) | ~23GB | 1x RTX 5090, 1x RTX 4090 |
 
-- **vLLM Engine (`vllm.sh`)**: Runs the massive `google/gemma-4-31b-it` model utilizing highly optimized `TORCH_SDPA` attention backends and `bfloat16` precision. It provides an OpenAI-compatible API on `localhost:8000`. For consumer GPUs (e.g., RTX 5090 32GB), INT4 AWQ quantization is supported with <3% quality loss on structured extraction tasks.
+- **vLLM Engine (`vllm.sh`)**: Runs `google/gemma-4-31b-it` with INT4 AWQ quantization by default, requiring only ~23GB VRAM. Uses `TORCH_SDPA` attention backend and provides an OpenAI-compatible API on `localhost:8000`. Full BF16 precision is optionally supported for data-center GPUs with 64GB+ VRAM.
 - **Intelligent Routing Pipeline (`api.py`)**:
   - **Classification**: Prompts the LLM to strictly classify the invoice as an `einvoice` (電子發票), `old` (傳統發票), or `hand` (手寫收據).
   - **Hybrid Extraction**: If the invoice is an `einvoice`, `gemma.py` invokes a deterministic QR decoder to extract the invoice number, date, and exact total amount. This guarantees that critical financial data suffers zero LLM hallucination.

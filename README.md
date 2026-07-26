@@ -37,19 +37,16 @@ This system operates across three distinct layers:
 ---
 
 ## ⚙️ Prerequisites
-Running a 31B parameter Vision model locally in `bfloat16` is highly resource-intensive. Ensure your system meets the following specifications:
+With INT4 AWQ quantization, the system runs comfortably on a single consumer GPU.
 
-**Hardware Requirements (AI Backend — Full Precision BF16):**
-- **GPU**: At least ~64GB+ of total VRAM is required to load the model weights and KV cache.
-  - *Recommended Setup*: 2x NVIDIA RTX A6000 (48GB), or 1x NVIDIA A100/H100 (80GB).
-  - *Alternative Setup*: Mac Studio with M2/M3 Ultra (128GB+ Unified Memory).
-- **RAM**: 64GB+ System RAM.
-- **Storage**: 100GB+ fast NVMe SSD storage for model weights.
-
-**Hardware Requirements (AI Backend — INT4 AWQ Quantized):**
-- **GPU**: A single NVIDIA RTX 5090 (32GB) or RTX 4090 (24GB) is sufficient.
+**Hardware Requirements (AI Backend):**
+- **GPU (Recommended — INT4 AWQ)**: A single GPU with **24GB+ VRAM** is sufficient.
   - Model weights: ~16GB, leaving ample room for KV cache.
-  - Quality loss is <3% and negligible for structured OCR tasks.
+  - *Examples*: NVIDIA RTX 5090 (32GB), RTX 4090 (24GB).
+  - Quality loss is <3% and negligible for structured OCR/invoice tasks.
+- **GPU (Optional — Full BF16)**: For unquantized full precision, ~64GB+ VRAM is required (e.g. 2x A6000, 1x A100/H100).
+- **RAM**: 32GB+ System RAM.
+- **Storage**: 50GB+ for quantized model weights (100GB+ for full precision).
 
 **Software Requirements:**
 - **OS**: Linux (Ubuntu 20.04/22.04 recommended) or macOS (Apple Silicon).
