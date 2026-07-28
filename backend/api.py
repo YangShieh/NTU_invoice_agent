@@ -17,7 +17,7 @@ vllm_client = OpenAI(
 )
 
 # Replace with the exact model string used in your vLLM startup command
-MODEL_NAME = "cyankiwi/gemma-4-31B-it-AWQ-4bit"
+MODEL_NAME = "mattbucci/gemma-4-12B-AWQ"
 
 def encode_image_to_base64(image_path):
     """Convert local image to base64 for the vLLM vision payload."""

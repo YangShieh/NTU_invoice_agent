@@ -5,6 +5,9 @@ Called by session_ui.py via run_submission(), or directly:
 """
 
 import argparse, json, os, re, sys, time
+import tempfile
+import subprocess
+import platform
 from openai import OpenAI
 from playwright.sync_api import sync_playwright, Page
 
@@ -562,18 +565,68 @@ def add_payee(page: Page, payee_id: str, note: str, amount: str, payee: dict = N
 
 
 def print_receipt(page: Page) -> str:
-    """Extracts the ASN from the 列印黏存單 form and stores the print page URL."""
+    """Extracts ASN, downloads the PDF from printatt.asp via the authenticated session."""
     try:
         for frame in page.frames:
-            # Try to extract ASN from the hidden input in the print form
             asn_input = frame.locator("form[action*='printmain'] input[name='asn'], form:has(input[value='列印黏存單']) input[name='asn']")
             if asn_input.count() > 0:
                 asn = asn_input.first.get_attribute("value")
                 if asn:
                     print_url = f"https://ntuacc.cc.ntu.edu.tw/acc/apply/printatt.asp?asn={asn}"
                     _state["print_url"] = print_url
-                    print(f"🖨️ Print URL: {print_url}")
-                    return f"OK - ASN={asn}, print URL saved."
+                    print(f"🖨️ Downloading print page: {print_url}")
+
+                    # --- 修改開始：將檔案存到系統暫存資料夾 ---
+                    temp_dir = tempfile.gettempdir()
+                    pdf_path = os.path.join(temp_dir, f"ntu_receipt_{asn}.pdf")
+                    # ------------------------------------------
+
+                    try:
+                        with page.expect_download(timeout=15000) as download_info:
+                            page.evaluate(f"window.open('{print_url}')")
+                        download = download_info.value
+                        download.save_as(pdf_path)
+                        print(f"🖨️ PDF downloaded to {pdf_path}")
+                        
+                        # --- 新增：下載後自動開啟 PDF ---
+                        try:
+                            if platform.system() == 'Windows':
+                                os.startfile(pdf_path)
+                            elif platform.system() == 'Darwin': # macOS
+                                subprocess.call(['open', pdf_path])
+                            else: # Linux
+                                subprocess.call(['xdg-open', pdf_path])
+                            print("👁️ 自動彈出列印畫面")
+                        except Exception as e:
+                            print(f"⚠️ 無法自動開啟 PDF: {e}")
+                        # --------------------------------
+                        
+                        return f"OK - ASN={asn}, PDF downloaded and opened."
+                    except Exception:
+                        # Fallback: try clicking the actual form button
+                        print_btn = frame.locator("input[value*='列印黏存單']")
+                        if print_btn.count() > 0:
+                            with page.expect_download(timeout=15000) as download_info:
+                                print_btn.first.click(force=True)
+                            download = download_info.value
+                            download.save_as(pdf_path)
+                            print(f"🖨️ PDF downloaded (via button) to {pdf_path}")
+                            
+                            # --- 新增：Fallback 也要自動開啟 PDF ---
+                            try:
+                                if platform.system() == 'Windows':
+                                    os.startfile(pdf_path)
+                                elif platform.system() == 'Darwin':
+                                    subprocess.call(['open', pdf_path])
+                                else:
+                                    subprocess.call(['xdg-open', pdf_path])
+                                print("👁️ 自動彈出列印畫面")
+                            except Exception as e:
+                                pass
+                            # ---------------------------------------
+                            
+                            return f"OK - ASN={asn}, PDF downloaded and opened."
+                        raise
         return "ERROR: Could not find ASN for print page."
     except Exception as e:
         return f"ERROR in print_receipt: {e}"
@@ -781,7 +834,7 @@ def run_submission(cfg: dict, payee: dict, invoices: list, headless: bool = True
     
     pw = sync_playwright().start()
     browser = pw.chromium.launch(headless=True)
-    context = browser.new_context()
+    context = browser.new_context(accept_downloads=True, ignore_https_errors=True)
     page = context.new_page()
     
     _state["pw"], _state["browser"], _state["page"] = pw, browser, page
@@ -796,24 +849,8 @@ def run_submission(cfg: dict, payee: dict, invoices: list, headless: bool = True
     _save_audit_log(report_number, invoices, payee)
 
     if report_number:
-        print_url = _state.get("print_url")
-        if print_url:
-            # Save session state, close headless, open visible browser to print page
-            storage = context.storage_state()
-            browser.close()
-            
-            print("🖨️ Opening print page...")
-            visible_browser = pw.chromium.launch(headless=False)
-            visible_context = visible_browser.new_context(storage_state=storage)
-            visible_page = visible_context.new_page()
-            visible_page.goto(print_url)
-            visible_page.wait_for_load_state("networkidle")
-            
-            _state["browser"], _state["page"] = visible_browser, visible_page
-            print("✅ Agent finished. Print page is open.")
-        else:
-            print("✅ Agent finished. No print URL found.")
-            close_browser()
+        print("✅ Agent finished. PDF ready for download.")
+        close_browser()
     else:
         print("⚠️ Agent failed.")
 
@@ -824,7 +861,7 @@ _state = {"pw": None, "browser": None, "page": None}
 def open_browser_for_login() -> None:
     pw = sync_playwright().start()
     browser = pw.chromium.launch(headless=False)
-    page = browser.new_context().new_page()
+    page = browser.new_context(accept_downloads=True, ignore_https_errors=True).new_page()
     page.goto("https://ntuacc.cc.ntu.edu.tw/acc/")
     _state["pw"], _state["browser"], _state["page"] = pw, browser, page
 

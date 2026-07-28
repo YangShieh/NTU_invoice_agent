@@ -13,7 +13,7 @@ Open: http://localhost:8001
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, Response
-import uvicorn, json, os, shutil, requests, time
+import uvicorn, json, os, shutil, requests, time, subprocess
 from pydantic import BaseModel
 
 SESSION_FILE = "session.json"   # wiped after confirmation
@@ -38,15 +38,27 @@ def manifest():
         "name": "希望 - 報帳助理",
         "short_name": "希望",
         "description": "NTU 智慧報帳系統",
-        "start_url": "/",
+        "start_url": "/invoice_wish",
+        "scope": "/",
         "display": "standalone",
         "background_color": "#f5f5f0",
         "theme_color": "#1a237e",
+        "orientation": "portrait",
         "icons": [
             {"src": "/icon-512.svg", "sizes": "512x512", "type": "image/svg+xml", "purpose": "any maskable"}
         ]
     }
     return Response(content=json.dumps(m), media_type="application/manifest+json")
+
+@app.get("/sw.js")
+def service_worker():
+    """Minimal service worker to make the PWA installable."""
+    sw_code = """
+self.addEventListener('install', e => { self.skipWaiting(); });
+self.addEventListener('activate', e => { e.waitUntil(clients.claim()); });
+self.addEventListener('fetch', e => { e.respondWith(fetch(e.request)); });
+    """
+    return Response(content=sw_code.strip(), media_type="application/javascript")
 
 def load_config() -> dict:
     with open(CONFIG_FILE, encoding="utf-8") as f:
@@ -162,13 +174,14 @@ def run_agent_endpoint():
         raise HTTPException(400, "Invoice not confirmed yet")
 
     cfg = load_config()
-    from agent import run_submission
+    from agent import run_submission, _state
     try:
         report_number = run_submission(cfg, session["payee"], session["invoices"], headless=False)
         session["step"] = "agent_done"
         session["report_number"] = report_number
         save_session(session)
-        return {"ok": True, "report_number": report_number}
+        print_url = _state.get("print_url", "")
+        return {"ok": True, "report_number": report_number, "print_url": print_url}
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -180,11 +193,11 @@ def close_browser_endpoint():
 
 @app.get("/api/print-page")
 def get_print_page():
-    """Serve the captured PDF of the final print page."""
+    """Serve the captured PDF of the print page."""
     from fastapi.responses import FileResponse
     pdf_path = os.path.join(os.path.dirname(__file__), "print_page.pdf")
     if os.path.exists(pdf_path):
-        return FileResponse(pdf_path, media_type="application/pdf", filename="報帳點収單.pdf")
+        return FileResponse(pdf_path, media_type="application/pdf", filename="黏存單.pdf")
     raise HTTPException(404, "尚未產生列印頁面")
 
 @app.post("/api/wipe")
@@ -243,7 +256,21 @@ body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-co
   <a href="/invoice_wish" class="icon-btn"><span class="icon-text">希望</span></a>
   <p class="label">NTU 報帳助理</p>
   <p class="sublabel">點擊開始</p>
+  <button id="install-btn" style="display:none;margin-top:20px;padding:10px 24px;border:2px solid rgba(255,255,255,0.5);border-radius:20px;background:rgba(255,255,255,0.15);color:white;font-size:14px;cursor:pointer;backdrop-filter:blur(10px)">📲 安裝應用程式</button>
 </div>
+<script>
+if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
+let deferredPrompt;
+window.addEventListener('beforeinstallprompt', e => {
+  e.preventDefault();
+  deferredPrompt = e;
+  document.getElementById('install-btn').style.display = 'inline-block';
+});
+document.getElementById('install-btn')?.addEventListener('click', async () => {
+  if(deferredPrompt) { deferredPrompt.prompt(); await deferredPrompt.userChoice; deferredPrompt = null; }
+  document.getElementById('install-btn').style.display = 'none';
+});
+</script>
 </body>
 </html>
 """
@@ -268,6 +295,7 @@ def ui():
 <link rel="manifest" href="/manifest.json">
 <link rel="apple-touch-icon" href="/icon-512.svg">
 <title>希望 - 報帳助理</title>
+<script>if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');</script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:system-ui,sans-serif;background:#f5f5f0;color:#1a1a1a;padding:20px;max-width:640px;margin:0 auto}
@@ -352,7 +380,8 @@ textarea{resize:vertical;min-height:50px}
       <button class="btn btn-ghost" onclick="stopCamera()">取消</button>
     </div>
   </div>
-  <input type="file" id="file-input" accept="image/*" capture="environment" style="display:none" onchange="handleFile(this.files[0])">
+  <input type="file" id="file-input" accept="image/*" style="display:none" onchange="handleFile(this.files[0])">
+  <input type="file" id="camera-input" accept="image/*" capture="environment" style="display:none" onchange="handleFile(this.files[0])">
   <img id="preview">
   <div id="msg-upload"></div>
 </div>
@@ -403,7 +432,9 @@ textarea{resize:vertical;min-height:50px}
 <div class="card locked" id="card-done">
   <h2><span class="step-badge" id="badge-5">5</span>完成確認 &amp; 資料清除</h2>
   <p style="font-size:13px;color:#555">報帳條碼：<strong id="report-number">—</strong></p>
-  <p id="print-msg" style="font-size:13px;color:#16a34a;margin-top:8px;display:none">🖨️ 列印黏存單頁面已在瀏覽器中開啟，請直接列印。</p>
+  <div id="print-link-row" style="margin-top:10px;display:none">
+    <a id="print-link" href="/api/print-page" target="_blank" class="btn btn-primary" style="text-decoration:none">🖨️ 開啟黏存單列印</a>
+  </div>
   <p style="font-size:13px;color:#555;margin-top:10px">請確認列印黏存單已完成，然後點下方按鈕清除本機所有個人資料。</p>
   <div class="btn-row">
     <button class="btn btn-danger" onclick="wipeData()">確認完成，立即清除個人資料</button>
@@ -485,6 +516,12 @@ async function handleFile(file) {
 
 let stream = null;
 async function startCamera(deviceId = null) {
+  // If getUserMedia not available (non-HTTPS), fall back to native camera
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    document.getElementById('camera-input').click();
+    return;
+  }
+
   document.getElementById('drop-zone').style.display = 'none';
   document.getElementById('camera-btn-row').style.display = 'none';
   const container = document.getElementById('camera-container');
@@ -492,15 +529,18 @@ async function startCamera(deviceId = null) {
   
   if (stream) {
     stream.getTracks().forEach(t => t.stop());
+    stream = null;
   }
 
   const constraints = {
-    video: deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'environment' }
+    video: deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }
   };
 
   try {
     stream = await navigator.mediaDevices.getUserMedia(constraints);
-    document.getElementById('camera-video').srcObject = stream;
+    const video = document.getElementById('camera-video');
+    video.srcObject = stream;
+    await video.play();
     
     // Populate camera dropdown if it's the first time
     if (!deviceId) {
@@ -519,7 +559,16 @@ async function startCamera(deviceId = null) {
       }
     }
   } catch (err) {
-    alert("無法存取相機：" + err.message);
+    console.error('Camera error:', err);
+    if (err.name === 'NotAllowedError') {
+      alert("相機權限被拒絕。請在瀏覽器設定中允許相機存取。");
+    } else if (err.name === 'NotFoundError') {
+      alert("找不到相機裝置。請確認相機已連接。");
+    } else if (err.name === 'NotReadableError') {
+      alert("相機被其他程式佔用，請關閉其他使用相機的應用程式後重試。");
+    } else {
+      alert("無法存取相機：" + err.message + "\n\n如非 localhost 連線，請改用 http://localhost:8001/invoice_wish");
+    }
     stopCamera();
   }
 }
@@ -642,10 +691,10 @@ async function runAgent() {
   const res = await fetch('/api/run-agent', {method:'POST'});
   if (res.ok) {
     const data = await res.json();
-    document.getElementById('report-number').textContent = data.report_number || '（請查看瀏覽器視窗）';
+    document.getElementById('report-number').textContent = data.report_number || '—';
     document.getElementById('msg-agent').className = 'msg ok';
     document.getElementById('msg-agent').textContent = 'Agent 完成！';
-    document.getElementById('print-msg').style.display = 'block';
+    document.getElementById('print-link-row').style.display = 'block';
     markDone(4);
     unlock('card-done');
   } else {
@@ -676,5 +725,26 @@ async function wipeData() {
 </body>
 </html>"""
 
+def _ensure_ssl_certs():
+    """Generate self-signed SSL cert for HTTPS (enables camera on any network)."""
+    cert_dir = os.path.dirname(os.path.abspath(__file__))
+    cert_file = os.path.join(cert_dir, "cert.pem")
+    key_file = os.path.join(cert_dir, "key.pem")
+    if not os.path.exists(cert_file):
+        print("🔐 Generating self-signed SSL certificate...")
+        subprocess.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", key_file, "-out", cert_file,
+            "-days", "365", "-nodes",
+            "-subj", "/CN=invoice-agent"
+        ], check=True, capture_output=True)
+    return cert_file, key_file
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    try:
+        cert, key = _ensure_ssl_certs()
+        print("🚀 Starting HTTPS server on https://0.0.0.0:8001")
+        uvicorn.run(app, host="0.0.0.0", port=8001, ssl_keyfile=key, ssl_certfile=cert)
+    except Exception:
+        print("⚠️ openssl not found, falling back to HTTP (camera may not work on non-localhost)")
+        uvicorn.run(app, host="0.0.0.0", port=8001)

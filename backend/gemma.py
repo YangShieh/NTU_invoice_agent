@@ -83,7 +83,7 @@ PROMPTS = {
 class HighFidelityInvoiceAgent:
     def __init__(self):
         # 🎯 重要：修改為 vLLM 伺服器正在對外提供服務的確切模型名稱
-        self.model_id = "cyankiwi/gemma-4-31B-it-AWQ-4bit" 
+        self.model_id = "mattbucci/gemma-4-12B-AWQ" 
         
         # 🎯 重要：修改為您轉發的 vLLM 連接埠 (通常為 8080 或 8081)
         vllm_port = 8080 

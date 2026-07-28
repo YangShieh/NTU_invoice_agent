@@ -5,5 +5,58 @@
     "bank_code": "700",
     "account_number": "00013750605168"
   },
-  "step": "payee_saved"
+  "step": "agent_done",
+  "invoice": {
+    "invoice_number": "SZ75315716",
+    "date": "2025-10-01",
+    "total_amount": "996",
+    "UBN": "03734301",
+    "items": [
+      {
+        "name": "32 最新！新機進店(TIC壓力)",
+        "qty": 1,
+        "price": 616
+      },
+      {
+        "name": "折扣",
+        "qty": 1,
+        "price": -264
+      },
+      {
+        "name": "17 解說學廣(2/E)",
+        "qty": 1,
+        "price": 380
+      }
+    ],
+    "confidence_score": 1,
+    "detected_type": "einvoice",
+    "qr_verified": true,
+    "expense_purpose": "教材費(書籍)_32 最新！新機進店(TIC壓力)"
+  },
+  "invoices": [
+    {
+      "invoice_number": "SZ75315716",
+      "date": "2025-10-01",
+      "total_amount": "996",
+      "items": [
+        {
+          "name": "32 最新！新機進店(TIC壓力)",
+          "qty": "1",
+          "price": "616"
+        },
+        {
+          "name": "折扣",
+          "qty": "1",
+          "price": "-264"
+        },
+        {
+          "name": "17 解說學廣(2/E)",
+          "qty": "1",
+          "price": "380"
+        }
+      ],
+      "expense_purpose": "教材費(書籍)_32 最新！新機進店(TIC壓力)"
+    }
+  ],
+  "report_number": "6384012"
 }

@@ -11,6 +11,14 @@ session_image.jpg
 # Credentials (NEVER commit)
 config.json
 
+# SSL certs (auto-generated)
+cert.pem
+key.pem
+
+# Print output
+print_page.pdf
+print_page.html
+
 # Audit logs
 audit_*.json
 
@@ -20,3 +28,7 @@ audit_*.json
 # IDE
 .vscode/
 .idea/
+
+# Electron
+electron/node_modules/
+electron/dist/
