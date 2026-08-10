@@ -717,7 +717,7 @@ async function wipeData() {
     
     // 設定延遲 2 秒後自動重新整理頁面
     setTimeout(() => {
-        window.location.reload();
+        window.location.href = '/';
     }, 2000);
   }
 }

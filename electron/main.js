@@ -66,12 +66,6 @@ function createWindow(protocol) {
   // Hide the menu bar completely
   mainWindow.setMenuBarVisibility(false);
 
-  // Allow self-signed cert
-  app.on('certificate-error', (event, webContents, url, error, cert, callback) => {
-    event.preventDefault();
-    callback(true);
-  });
-
   mainWindow.loadURL(`${protocol}://localhost:${SERVER_PORT}/`);
 
   // Open print page in same window (not external browser)
@@ -101,6 +95,12 @@ function createWindow(protocol) {
 }
 
 app.whenReady().then(async () => {
+  // Allow self-signed SSL cert (must be before any loadURL)
+  app.on('certificate-error', (event, webContents, url, error, cert, callback) => {
+    event.preventDefault();
+    callback(true);
+  });
+
   console.log('Starting server...');
   startServer();
 
