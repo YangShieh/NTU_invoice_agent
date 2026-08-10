@@ -1,0 +1,9 @@
+{
+    "project_code": "114L3073",
+    "expense_type": "教材費(書籍)",
+    "agent_model": "mattbucci/gemma-4-12B-AWQ",
+    "ntu_username": "YOUR_NTU_ID",
+    "ntu_password": "YOUR_NTU_PASSWORD",
+    "agent_base_url": "http://localhost:8080/v1",
+    "ocr_base_url": "http://localhost:8000"
+}
