@@ -1,15 +1,18 @@
-# AI Vision Backend
-# Used by: api.py, gemma.py, vllm.sh
-# Install: pip install -r requirements_backend.txt
-# Note: Requires ~64GB+ VRAM to run google/gemma-4-31b-it in bfloat16
-#
+# Ubuntu 22.04 / WSL2, Python 3.10, NVIDIA GPU
+# vLLM supplies a compatible CUDA-enabled PyTorch build; do not install a
+# separate torch wheel over it.
+vllm==0.25.1
 
+# OpenAI-compatible client and invoice HTTP API
+openai>=1.68,<3
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34,<1
+python-multipart>=0.0.20,<1
 
-vllm
-openai
-torch
-opencv-python
-Pillow
-pyzbar
-qreader
-opencc
+# Image and QR processing. QReader 3.16 explicitly depends on opencv-python,
+# so use that distribution rather than installing a second headless OpenCV.
+opencv-python>=4.10,<5
+Pillow>=10.4,<13
+pyzbar>=0.1.9,<1
+qreader==3.16
+opencc-python-reimplemented>=0.1.7,<1

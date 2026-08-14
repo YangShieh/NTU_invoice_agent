@@ -1,9 +1,6 @@
-VLLM_ATTENTION_BACKEND=TORCH_SDPA \
-TOKENIZERS_PARALLELISM=false python -m vllm.entrypoints.openai.api_server \
-    --model google/gemma-4-31b-it \
-    --port 8000 \
-    --dtype bfloat16 \
-    --max-model-len 16384 \
-    --trust-remote-code \
-    --enable-auto-tool-choice \
-    --tool-call-parser gemma4 
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Compatibility wrapper. The former 31B/bfloat16 configuration requires far
+# more than the 16 GB VRAM available on an RTX 4070 Ti Super.
+exec "$(dirname "$0")/vllm_4bit.sh" "$@"

@@ -11,13 +11,9 @@ app = FastAPI(title="Invoice Extraction API")
 
 # Initialize OpenAI client pointing to the local vLLM server
 # The API key can be anything when querying a local vLLM instance
-vllm_client = OpenAI(
-    base_url="http://localhost:8080/v1",
-    api_key="vllm-local"
-)
-
-# Replace with the exact model string used in your vLLM startup command
-MODEL_NAME = "mattbucci/gemma-4-12B-AWQ"
+VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:8080/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "mattbucci/gemma-4-12B-AWQ")
+vllm_client = OpenAI(base_url=VLLM_BASE_URL, api_key="vllm-local")
 
 def encode_image_to_base64(image_path):
     """Convert local image to base64 for the vLLM vision payload."""

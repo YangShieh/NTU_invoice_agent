@@ -1,15 +1,23 @@
-export VLLM_USE_V1=0
-export FLASHINFER_DISABLE_VERSION_CHECK=1
-export VLLM_ATTENTION_BACKEND=TORCH_SDPA
-export TOKENIZERS_PARALLELISM=false
+#!/usr/bin/env bash
+set -euo pipefail
 
-python -m vllm.entrypoints.openai.api_server \
-    --model mattbucci/gemma-4-12B-AWQ \
-    --port 8080 \
-    --max-model-len 8192 \
-    --gpu-memory-utilization 0.70 \
-    --trust-remote-code \
+# Sized for one RTX 4070 Ti Super (16 GB). Values can be overridden, e.g.
+# MAX_MODEL_LEN=2048 GPU_MEMORY_UTILIZATION=0.85 ./vllm_4bit.sh
+MODEL_NAME="${MODEL_NAME:-mattbucci/gemma-4-12B-AWQ}"
+VLLM_PORT="${VLLM_PORT:-8080}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
+
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+
+exec vllm serve "${MODEL_NAME}" \
+    --host 0.0.0.0 \
+    --port "${VLLM_PORT}" \
     --dtype auto \
     --quantization awq \
+    --max-model-len "${MAX_MODEL_LEN}" \
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
+    --max-num-seqs 1 \
     --enable-auto-tool-choice \
-    --tool-call-parser gemma4
+    --tool-call-parser gemma4 \
+    --trust-remote-code
