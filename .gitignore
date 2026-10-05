@@ -21,6 +21,8 @@ print_page.html
 
 # Audit logs
 audit_*.json
+frontend/logs/
+backend/logs/
 
 # macOS
 .DS_Store

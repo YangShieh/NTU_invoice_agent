@@ -1,6 +1,7 @@
 const { app, BrowserWindow, shell } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
+const fs = require('fs');
 const https = require('https');
 const http = require('http');
 
@@ -8,8 +9,41 @@ const SERVER_PORT = 8001;
 const FRONTEND_DIR = path.join(__dirname, '..', 'frontend');
 let serverProcess = null;
 let mainWindow = null;
+let isQuitting = false;
+let restartAttempts = 0;
+
+function writeDiagnostic(stage, outcome, details = {}) {
+  try {
+    const now = new Date();
+    const logDir = path.join(FRONTEND_DIR, 'logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    const safe = JSON.stringify(details)
+      .replace(/\b[A-Z][12]\d{8}\b/g, '[REDACTED_ID]')
+      .replace(/\b[A-Z]{2}\d{8}\b/g, '[REDACTED_INVOICE]')
+      .replace(/\b\d{10,16}\b/g, '[REDACTED_NUMBER]');
+    const record = {
+      timestamp_utc: now.toISOString(),
+      case_id: 'desktop-process',
+      stage,
+      outcome,
+      details: JSON.parse(safe)
+    };
+    const day = now.toISOString().slice(0, 10);
+    fs.appendFileSync(path.join(logDir, `electron-${day}.jsonl`), `${JSON.stringify(record)}\n`);
+    const cutoff = now.getTime() - (30 * 24 * 60 * 60 * 1000);
+    for (const name of fs.readdirSync(logDir)) {
+      const oldPath = path.join(logDir, name);
+      if (name.startsWith('electron-') && fs.statSync(oldPath).mtimeMs < cutoff) {
+        fs.unlinkSync(oldPath);
+      }
+    }
+  } catch (_) {
+    // Diagnostics must never stop the desktop application.
+  }
+}
 
 function startServer() {
+  const stderrTail = [];
   serverProcess = spawn('python', ['session_ui.py'], {
     cwd: FRONTEND_DIR,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -17,10 +51,37 @@ function startServer() {
   });
 
   serverProcess.stdout.on('data', d => console.log('[Server]', d.toString().trim()));
-  serverProcess.stderr.on('data', d => console.error('[Server]', d.toString().trim()));
+  serverProcess.stderr.on('data', d => {
+    const line = d.toString().trim();
+    console.error('[Server]', line);
+    stderrTail.push(line.slice(-1000));
+    if (stderrTail.length > 10) stderrTail.shift();
+  });
+  serverProcess.on('error', err => {
+    writeDiagnostic('desktop.server_spawn', 'failed', { error: String(err) });
+  });
   serverProcess.on('close', code => {
     console.log(`Server exited with code ${code}`);
     serverProcess = null;
+    if (!isQuitting) {
+      writeDiagnostic('desktop.server', 'failed', { exit_code: code, stderr_tail: stderrTail });
+      if (restartAttempts < 3) {
+        restartAttempts += 1;
+        writeDiagnostic('desktop.server_restart', 'started', { attempt: restartAttempts });
+        setTimeout(() => {
+          startServer();
+          waitForServer().then(() => {
+            writeDiagnostic('desktop.server_restart', 'completed', { attempt: restartAttempts });
+            if (mainWindow && !mainWindow.isDestroyed()) mainWindow.reload();
+          }).catch(err => {
+            writeDiagnostic('desktop.server_restart', 'failed', {
+              attempt: restartAttempts,
+              error: String(err)
+            });
+          });
+        }, Math.min(1000 * (2 ** (restartAttempts - 1)), 5000));
+      }
+    }
   });
 }
 
@@ -115,6 +176,7 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
+  isQuitting = true;
   if (serverProcess) {
     serverProcess.kill('SIGTERM');
     serverProcess = null;
@@ -123,6 +185,7 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  isQuitting = true;
   if (serverProcess) {
     serverProcess.kill('SIGTERM');
     serverProcess = null;

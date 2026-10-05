@@ -1,11 +1,13 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Header, UploadFile
 import uvicorn
-import shutil
 import os
 import json
 import base64
+import tempfile
+import time
 from openai import OpenAI
 from gemma import scan_taiwan_einvoice_qr, clean_json_output, validate_and_clean_data, PROMPTS
+from diagnostics import error_details, log_event
 
 app = FastAPI(title="Invoice Extraction API")
 
@@ -70,20 +72,34 @@ def extract_invoice_vllm(base64_image, prompt):
     return response.choices[0].message.content
 
 @app.post("/extract")
-async def extract_invoice(file: UploadFile = File(...)):
-    temp_path = f"temp_{file.filename}"
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
+async def extract_invoice(
+    file: UploadFile = File(...), x_case_id: str = Header(default="unassigned")
+):
+    started = time.monotonic()
+    suffix = os.path.splitext(file.filename or "upload.jpg")[1][:10] or ".jpg"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as buffer:
+        temp_path = buffer.name
+        while chunk := await file.read(1024 * 1024):
+            buffer.write(chunk)
+    log_event(
+        x_case_id, "ocr.backend", "started",
+        content_type=file.content_type or "unknown",
+        size_bytes=os.path.getsize(temp_path),
+    )
     try:
         # Encode image once for all vLLM calls
         base64_image = encode_image_to_base64(temp_path)
 
         # 1. Classification & QR scan
         invoice_type = classify_invoice_vllm(base64_image)
+        log_event(x_case_id, "ocr.classification", "completed", detected_type=invoice_type)
         qr_data = None
         if invoice_type == "einvoice":
             qr_data = scan_taiwan_einvoice_qr(temp_path)
+            log_event(
+                x_case_id, "ocr.qr", "completed" if qr_data else "not_found",
+                qr_verified=bool(qr_data),
+            )
             
         # 2. VLM Deep Extraction via vLLM
         task_prompt = PROMPTS[invoice_type]
@@ -103,15 +119,25 @@ async def extract_invoice(file: UploadFile = File(...)):
             invoice_data["qr_verified"] = False
 
         invoice_data = validate_and_clean_data(invoice_data)
-        
-        # Clean up temp file
-        os.remove(temp_path)
+        log_event(
+            x_case_id, "ocr.backend", "completed",
+            duration_ms=round((time.monotonic() - started) * 1000),
+            detected_type=invoice_type,
+            qr_verified=bool(qr_data),
+            item_count=len(invoice_data.get("items", [])),
+        )
         return invoice_data
 
     except Exception as e:
+        log_event(
+            x_case_id, "ocr.backend", "failed",
+            duration_ms=round((time.monotonic() - started) * 1000),
+            **error_details(e),
+        )
+        return {"error": str(e)}
+    finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
-        return {"error": str(e)}
 
 if __name__ == "__main__":
     # FastAPI runs on 8000, calling vLLM on 8080

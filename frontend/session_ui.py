@@ -15,6 +15,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, Response
 import uvicorn, json, os, shutil, requests, time, subprocess
 from pydantic import BaseModel
+from diagnostics import error_details, log_event, new_case_id
 
 SESSION_FILE = "session.json"   # wiped after confirmation
 TEMP_IMAGE   = "session_image.jpg"
@@ -74,6 +75,13 @@ def save_session(data: dict):
     with open(SESSION_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+def ensure_case_id(session: dict) -> str:
+    case_id = session.get("case_id")
+    if not case_id:
+        case_id = new_case_id()
+        session["case_id"] = case_id
+    return case_id
+
 def wipe_session():
     """Remove all personal data from disk."""
     for path in [SESSION_FILE, TEMP_IMAGE, "print_page.pdf"]:
@@ -102,16 +110,30 @@ class InvoiceData(BaseModel):
 @app.post("/api/payee")
 def save_payee(p: PayeeInfo):
     session = load_session()
+    case_id = ensure_case_id(session)
     session["payee"] = p.model_dump()
-    session["step"] = "payee_saved"
+    # Editing personal data must not discard already-confirmed invoices.
+    session["step"] = "invoice_confirmed" if session.get("invoices") else "payee_saved"
     save_session(session)
+    log_event(case_id, "session.payee", "completed")
     return {"ok": True}
 
 @app.post("/api/upload")
 async def upload_image(file: UploadFile = File(...)):
+    session = load_session()
+    case_id = ensure_case_id(session)
+    save_session(session)
+    started = time.monotonic()
     # Save image to temp path
     with open(TEMP_IMAGE, "wb") as buf:
         shutil.copyfileobj(file.file, buf)
+    log_event(
+        case_id,
+        "ocr.upload",
+        "started",
+        content_type=file.content_type or "unknown",
+        size_bytes=os.path.getsize(TEMP_IMAGE),
+    )
     # Run OCR
     cfg = load_config()
     try:
@@ -119,15 +141,26 @@ async def upload_image(file: UploadFile = File(...)):
             resp = requests.post(
                 f"{cfg['ocr_base_url']}/extract",
                 files={"file": (file.filename, f, "image/jpeg")},
+                headers={"X-Case-ID": case_id},
                 timeout=120,
             )
         resp.raise_for_status()
         invoice = resp.json()
     except Exception as e:
-        raise HTTPException(500, f"OCR failed: {e}")
+        log_event(
+            case_id, "ocr.request", "failed",
+            duration_ms=round((time.monotonic() - started) * 1000),
+            **error_details(e),
+        )
+        raise HTTPException(500, f"OCR failed: {e}（案件 ID: {case_id}）")
 
     if "error" in invoice:
-        raise HTTPException(500, invoice["error"])
+        log_event(
+            case_id, "ocr.extraction", "failed",
+            duration_ms=round((time.monotonic() - started) * 1000),
+            backend_error=invoice["error"],
+        )
+        raise HTTPException(500, f"{invoice['error']}（案件 ID: {case_id}）")
 
     # Build default expense_purpose
     items = invoice.get("items", [])
@@ -137,53 +170,163 @@ async def upload_image(file: UploadFile = File(...)):
     else:
         invoice["expense_purpose"] = cfg["expense_type"]
 
-    session = load_session()
     session["invoice"] = invoice
     session["step"] = "ocr_done"
     save_session(session)
+    required = ("invoice_number", "date", "total_amount", "items")
+    log_event(
+        case_id, "ocr.extraction", "completed",
+        duration_ms=round((time.monotonic() - started) * 1000),
+        detected_type=invoice.get("detected_type", "unknown"),
+        qr_verified=bool(invoice.get("qr_verified")),
+        confidence_score=invoice.get("confidence_score"),
+        missing_fields=[key for key in required if not invoice.get(key)],
+        item_count=len(items),
+    )
     return invoice
 
 @app.post("/api/confirm-invoice")
 def confirm_invoice(data: InvoiceData):
     """User has reviewed/edited the OCR data — save final version."""
     session = load_session()
+    case_id = ensure_case_id(session)
+    original = session.get("invoice", {})
+    submitted = data.model_dump()
+    changed_fields = [
+        key for key in ("invoice_number", "date", "total_amount", "items", "expense_purpose")
+        if original.get(key) != submitted.get(key)
+    ]
     if "invoices" not in session:
         session["invoices"] = []
-    session["invoices"].append(data.model_dump())
+    session["invoices"].append(submitted)
     session["step"] = "invoice_confirmed"
     save_session(session)
+    log_event(
+        case_id, "invoice.review", "completed",
+        changed_fields=changed_fields,
+        correction_count=len(changed_fields),
+    )
     return {"ok": True, "count": len(session["invoices"])}
+
+@app.get("/api/invoices")
+def list_invoices():
+    session = load_session()
+    return {"invoices": session.get("invoices", [])}
+
+@app.put("/api/invoices/{invoice_index}")
+def update_invoice(invoice_index: int, data: InvoiceData):
+    session = load_session()
+    case_id = ensure_case_id(session)
+    invoices = session.get("invoices", [])
+    if invoice_index < 0 or invoice_index >= len(invoices):
+        raise HTTPException(404, f"找不到指定發票（案件 ID: {case_id}）")
+    old = invoices[invoice_index]
+    updated = data.model_dump()
+    changed_fields = [key for key in updated if old.get(key) != updated.get(key)]
+    invoices[invoice_index] = updated
+    session["invoices"] = invoices
+    session["invoice"] = updated
+    session["step"] = "invoice_confirmed"
+    save_session(session)
+    log_event(
+        case_id, "invoice.edit", "completed", invoice_index=invoice_index,
+        changed_fields=changed_fields, correction_count=len(changed_fields),
+    )
+    return {"ok": True, "count": len(invoices)}
 
 @app.post("/api/open-browser")
 def open_browser_endpoint():
     """Step A — open browser to NTU login page for the user to log in manually."""
     from agent import open_browser_for_login
+    session = load_session()
+    case_id = ensure_case_id(session)
+    save_session(session)
     try:
         open_browser_for_login()
+        log_event(case_id, "browser.open", "completed")
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(500, str(e))
+        log_event(case_id, "browser.open", "failed", **error_details(e))
+        raise HTTPException(500, f"{e}（案件 ID: {case_id}）")
 
 @app.post("/api/run-agent")
-def run_agent_endpoint():
+def run_agent_endpoint(manual: bool = False):
     """Step B — called after the user confirms they've logged in. Runs the agent loop."""
     session = load_session()
+    case_id = ensure_case_id(session)
     if "payee" not in session or "invoices" not in session or not session["invoices"]:
-        raise HTTPException(400, "Missing payee or invoices data in session")
+        log_event(case_id, "agent.validation", "failed", reason="missing_payee_or_invoices")
+        raise HTTPException(400, f"Missing payee or invoices data in session（案件 ID: {case_id}）")
     if session.get("step") != "invoice_confirmed":
-        raise HTTPException(400, "Invoice not confirmed yet")
+        log_event(case_id, "agent.validation", "failed", reason="invoice_not_confirmed")
+        raise HTTPException(400, f"Invoice not confirmed yet（案件 ID: {case_id}）")
 
     cfg = load_config()
     from agent import run_submission, _state
+    started = time.monotonic()
+    max_attempts = 1 if manual else 3
+    log_event(
+        case_id, "agent.run", "started", invoice_count=len(session["invoices"]),
+        max_attempts=max_attempts, manual_retry=manual,
+    )
+    report_number = ""
+    last_error = None
+    completed_attempt = 0
+    for attempt in range(1, max_attempts + 1):
+        attempt_started = time.monotonic()
+        log_event(case_id, "agent.attempt", "started", attempt=attempt, max_attempts=max_attempts)
+        try:
+            report_number = run_submission(
+                cfg, session["payee"], session["invoices"], headless=False,
+                case_id=case_id,
+            )
+            if not report_number:
+                raise RuntimeError("Agent ended without a report number")
+            completed_attempt = attempt
+            log_event(
+                case_id, "agent.attempt", "completed", attempt=attempt,
+                duration_ms=round((time.monotonic() - attempt_started) * 1000),
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+            log_event(
+                case_id, "agent.attempt", "failed", attempt=attempt,
+                duration_ms=round((time.monotonic() - attempt_started) * 1000),
+                **error_details(exc),
+            )
+            from agent import close_browser
+            try:
+                close_browser()
+            except Exception:
+                pass
+            if attempt < max_attempts:
+                time.sleep(min(2 ** (attempt - 1), 4))
+
     try:
-        report_number = run_submission(cfg, session["payee"], session["invoices"], headless=False)
+        if not report_number:
+            raise last_error or RuntimeError("Agent failed")
         session["step"] = "agent_done"
         session["report_number"] = report_number
         save_session(session)
         print_url = _state.get("print_url", "")
-        return {"ok": True, "report_number": report_number, "print_url": print_url}
+        log_event(
+            case_id, "agent.run", "completed",
+            duration_ms=round((time.monotonic() - started) * 1000),
+            print_url_available=bool(print_url),
+            completed_attempt=completed_attempt,
+        )
+        return {
+            "ok": True, "report_number": report_number, "print_url": print_url,
+            "attempts": completed_attempt,
+        }
     except Exception as e:
-        raise HTTPException(500, str(e))
+        log_event(
+            case_id, "agent.run", "failed",
+            duration_ms=round((time.monotonic() - started) * 1000),
+            **error_details(e),
+        )
+        raise HTTPException(500, f"{e}（案件 ID: {case_id}）")
 
 @app.post("/api/close-browser")
 def close_browser_endpoint():
@@ -196,13 +339,18 @@ def get_print_page():
     """Serve the captured PDF of the print page."""
     from fastapi.responses import FileResponse
     pdf_path = os.path.join(os.path.dirname(__file__), "print_page.pdf")
+    case_id = load_session().get("case_id", "unassigned")
     if os.path.exists(pdf_path):
+        log_event(case_id, "print.serve", "completed", size_bytes=os.path.getsize(pdf_path))
         return FileResponse(pdf_path, media_type="application/pdf", filename="黏存單.pdf")
+    log_event(case_id, "print.serve", "failed", reason="pdf_not_found")
     raise HTTPException(404, "尚未產生列印頁面")
 
 @app.post("/api/wipe")
 def wipe_endpoint():
     """User confirms completion — wipe all personal data."""
+    case_id = load_session().get("case_id", "unassigned")
+    log_event(case_id, "session.wipe", "completed")
     wipe_session()
     from agent import close_browser
     try:
@@ -277,13 +425,6 @@ document.getElementById('install-btn')?.addEventListener('click', async () => {
 
 @app.get("/invoice_wish", response_class=HTMLResponse)
 def ui():
-    # Clear any previous session invoices on page refresh
-    session = load_session()
-    if "invoices" in session:
-        session["invoices"] = []
-    if "step" in session:
-        session["step"] = "payee_saved" if "payee" in session else ""
-    save_session(session)
     return r"""<!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -333,11 +474,20 @@ textarea{resize:vertical;min-height:50px}
 .items-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}
 .items-table th{background:#f5f5f0;padding:5px 8px;text-align:left;font-weight:500}
 .items-table td{padding:5px 8px;border-top:1px solid #eee}
+.top-nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+.invoice-list{display:grid;gap:8px;margin:10px 0 14px}
+.invoice-summary{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid #e0ddd6;border-radius:9px;background:#fafaf8}
+.invoice-summary-main{min-width:0;font-size:12px;color:#555}
+.invoice-summary-main strong{display:block;color:#222;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.failure-actions{display:none;margin-top:10px;padding-top:10px;border-top:1px solid #fecaca}
 </style>
 </head>
 <body>
 <h1>NTU 報帳助理</h1>
-<p class="subtitle">資料於確認完成後立即從裝置刪除</p>
+<div class="top-nav">
+  <p class="subtitle" style="margin-bottom:0">資料於確認完成後立即從裝置刪除</p>
+  <button class="btn btn-ghost" onclick="goHome()">⌂ 回主頁並清除資料</button>
+</div>
 
 <!-- Step 1: Payee info -->
 <div class="card" id="card-payee">
@@ -356,6 +506,7 @@ textarea{resize:vertical;min-height:50px}
   </div>
   <div class="btn-row">
     <button class="btn btn-primary" onclick="savePayee()">儲存並繼續</button>
+    <button class="btn btn-ghost" onclick="goHome()">回主頁並清除資料</button>
   </div>
   <div id="msg-payee"></div>
 </div>
@@ -405,15 +556,16 @@ textarea{resize:vertical;min-height:50px}
     <button class="btn btn-ghost" onclick="addItemRow()" style="margin-top:6px;font-size:12px;">＋ 新增品項</button>
   </div>
   <div class="btn-row">
-    <button class="btn btn-success" onclick="confirmInvoice()">確認此筆發票</button>
+    <button class="btn btn-success" id="btn-confirm-invoice" onclick="confirmInvoice()">確認此筆發票</button>
     <button class="btn btn-ghost" onclick="resetOcr()">重新上傳此筆</button>
+    <button class="btn btn-ghost" onclick="backToPayee()">回上一步修改個人資料</button>
   </div>
   <div id="msg-review"></div>
   <div id="invoice-actions" style="display:none; margin-top:15px; padding-top:15px; border-top:1px solid #eee;">
     <p style="font-size:13px; margin-bottom:10px;">目前已確認 <strong id="inv-count">0</strong> 筆發票。</p>
     <div class="btn-row">
       <button class="btn btn-ghost" onclick="addAnotherInvoice()">新增另一筆發票</button>
-      <button class="btn btn-primary" onclick="finishInvoices()">全部確認，進入下一步</button>
+      <button class="btn btn-primary" onclick="finishInvoices()">全部確認並自動執行 Agent</button>
     </div>
   </div>
 </div>
@@ -421,11 +573,25 @@ textarea{resize:vertical;min-height:50px}
 <!-- Step 4: Login + Agent running -->
 <div class="card locked" id="card-agent">
   <h2><span class="step-badge" id="badge-4">4</span>登入並執行 Agent</h2>
-  <p style="font-size:13px;color:#555">點擊下方按鈕將開啟瀏覽器、自動登入，並執行報帳任務。</p>
+  <div>
+    <label>本輪已確認發票</label>
+    <div class="invoice-list" id="agent-invoice-list"></div>
+  </div>
+  <p style="font-size:13px;color:#555">全部發票確認後，系統會自動登入並執行報帳任務。</p>
   <div class="btn-row">
-    <button class="btn btn-primary" id="btn-run-agent" onclick="runAgent()">開啟瀏覽器並自動登入執行</button>
+    <button class="btn btn-primary" id="btn-run-agent" onclick="runAgent()" style="display:none">執行 Agent</button>
+    <button class="btn btn-ghost" onclick="backToInvoices()">回上一步修改發票</button>
+    <button class="btn btn-ghost" onclick="backToPayee()">修改個人資料</button>
+    <button class="btn btn-ghost" onclick="goHome()">回主頁並清除資料</button>
   </div>
   <div id="msg-agent" style="margin-top:10px"></div>
+  <div class="failure-actions" id="agent-failure-actions">
+    <p style="font-size:12px;color:#991b1b">自動重試仍未完成。可保留目前資料手動重試；若再次失敗，仍可繼續按此按鈕重試。</p>
+    <div class="btn-row">
+      <button class="btn btn-primary" id="btn-manual-retry" onclick="runAgent(true)">手動重試</button>
+      <button class="btn btn-danger" onclick="clearAndGoHome()">清除資料並回主頁</button>
+    </div>
+  </div>
 </div>
 
 <!-- Step 5: Done + wipe -->
@@ -443,6 +609,8 @@ textarea{resize:vertical;min-height:50px}
 </div>
 
 <script>
+let currentInvoices = [];
+let editingInvoiceIndex = null;
 const unlock = id => document.getElementById(id).classList.remove('locked');
 const setMsg = (id, text, type) => {
   const el = document.getElementById(id);
@@ -472,9 +640,28 @@ async function savePayee() {
     setMsg('msg-payee', '已儲存（資料僅存於本機，提交後自動刪除）', 'ok');
     markDone(1);
     unlock('card-upload');
+    if (currentInvoices.length) document.getElementById('btn-run-agent').disabled = false;
   } else {
     setMsg('msg-payee', '儲存失敗', 'err');
   }
+}
+
+function goHome() {
+  return clearAndGoHome();
+}
+
+function backToPayee() {
+  unlock('card-payee');
+  document.getElementById('btn-run-agent').disabled = true;
+  document.getElementById('card-payee').scrollIntoView({behavior:'smooth'});
+  setMsg('msg-payee', '可直接修改資料，再按「儲存並繼續」。', 'info');
+}
+
+function backToInvoices() {
+  unlock('card-upload');
+  unlock('card-review');
+  document.getElementById('card-review').scrollIntoView({behavior:'smooth'});
+  setMsg('msg-review', '請從 Agent 上方的發票清單選擇「編輯」，或新增另一筆發票。', 'info');
 }
 
 function handleDrop(e) {
@@ -625,14 +812,7 @@ function populateReview(d) {
   document.getElementById('ocr-warn').style.display = low < 80 ? 'block' : 'none';
 }
 
-function addItemRow(name, qty, price) {
-  const tbody = document.getElementById('items-body');
-  const tr = document.createElement('tr');
-  tr.innerHTML = `<td><input type="text" value="${name||''}" class="item-name" style="width:100%"></td><td><input type="number" value="${qty||1}" class="item-qty" style="width:60px"></td><td><input type="number" value="${price||''}" class="item-price" style="width:80px"></td><td><button class="btn btn-ghost" onclick="this.closest('tr').remove()" style="padding:2px 6px;font-size:11px;color:#e74c3c">✕</button></td>`;
-  tbody.appendChild(tr);
-}
-
-async function confirmInvoice() {
+function makeInvoiceBody() {
   const items = [];
   document.querySelectorAll('#items-body tr').forEach(tr => {
     const name = tr.querySelector('.item-name');
@@ -640,20 +820,108 @@ async function confirmInvoice() {
     const price = tr.querySelector('.item-price');
     if (name) items.push({name: name.value, qty: qty ? qty.value : '1', price: price ? price.value : ''});
   });
-  const body = {
+  return {
     invoice_number: document.getElementById('r-invnum').value.trim(),
     date: document.getElementById('r-date').value.trim(),
     total_amount: document.getElementById('r-amount').value.trim(),
     items,
     expense_purpose: document.getElementById('r-purpose').value.trim(),
   };
+}
+
+async function loadInvoices() {
+  const res = await fetch('/api/invoices');
+  if (!res.ok) return;
+  const data = await res.json();
+  currentInvoices = data.invoices || [];
+  renderInvoiceList();
+}
+
+function renderInvoiceList() {
+  const list = document.getElementById('agent-invoice-list');
+  list.innerHTML = '';
+  currentInvoices.forEach((invoice, index) => {
+    const row = document.createElement('div');
+    row.className = 'invoice-summary';
+    const main = document.createElement('div');
+    main.className = 'invoice-summary-main';
+    const title = document.createElement('strong');
+    title.textContent = `第 ${index + 1} 筆｜${invoice.invoice_number || '無號碼'}`;
+    const detail = document.createElement('span');
+    detail.textContent = `${invoice.date || '無日期'}｜NT$ ${invoice.total_amount || '0'}｜${invoice.expense_purpose || '無摘要'}`;
+    main.append(title, detail);
+    const edit = document.createElement('button');
+    edit.className = 'btn btn-ghost';
+    edit.textContent = '編輯';
+    edit.onclick = () => editInvoice(index);
+    row.append(main, edit);
+    list.appendChild(row);
+  });
+  if (!currentInvoices.length) {
+    const empty = document.createElement('div');
+    empty.className = 'msg info';
+    empty.textContent = '尚未確認發票。';
+    list.appendChild(empty);
+  }
+  document.getElementById('inv-count').textContent = currentInvoices.length;
+}
+
+function editInvoice(index) {
+  const invoice = currentInvoices[index];
+  if (!invoice) return;
+  editingInvoiceIndex = index;
+  document.getElementById('btn-run-agent').disabled = true;
+  unlock('card-review');
+  document.querySelectorAll('#card-review input').forEach(el => el.disabled = false);
+  populateReview(invoice);
+  document.getElementById('btn-confirm-invoice').textContent = '儲存修改';
+  document.getElementById('invoice-actions').style.display = 'none';
+  setMsg('msg-review', `正在編輯第 ${index + 1} 筆發票`, 'info');
+  document.getElementById('card-review').scrollIntoView({behavior:'smooth'});
+}
+
+function addItemRow(name, qty, price) {
+  const tbody = document.getElementById('items-body');
+  const tr = document.createElement('tr');
+  const fields = [
+    {type:'text', value:name || '', className:'item-name', width:'100%'},
+    {type:'number', value:qty || 1, className:'item-qty', width:'60px'},
+    {type:'number', value:price || '', className:'item-price', width:'80px'},
+  ];
+  fields.forEach(field => {
+    const td = document.createElement('td');
+    const input = document.createElement('input');
+    input.type = field.type;
+    input.value = field.value;
+    input.className = field.className;
+    input.style.width = field.width;
+    td.appendChild(input);
+    tr.appendChild(td);
+  });
+  const actionCell = document.createElement('td');
+  const remove = document.createElement('button');
+  remove.className = 'btn btn-ghost';
+  remove.textContent = '✕';
+  remove.style.cssText = 'padding:2px 6px;font-size:11px;color:#e74c3c';
+  remove.onclick = () => tr.remove();
+  actionCell.appendChild(remove);
+  tr.appendChild(actionCell);
+  tbody.appendChild(tr);
+}
+
+async function confirmInvoice() {
+  const body = makeInvoiceBody();
   if (!body.invoice_number || !body.total_amount) {
     setMsg('msg-review', '發票號碼和金額為必填', 'err'); return;
   }
-  const res = await fetch('/api/confirm-invoice', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  const isEditing = editingInvoiceIndex !== null;
+  const url = isEditing ? `/api/invoices/${editingInvoiceIndex}` : '/api/confirm-invoice';
+  const res = await fetch(url, {method:isEditing ? 'PUT' : 'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
   if (res.ok) {
     const data = await res.json();
-    setMsg('msg-review', '已確認此筆發票。', 'ok');
+    setMsg('msg-review', isEditing ? '發票修改已儲存。' : '已確認此筆發票。', 'ok');
+    editingInvoiceIndex = null;
+    document.getElementById('btn-confirm-invoice').textContent = '確認此筆發票';
     document.getElementById('invoice-actions').style.display = 'block';
     document.getElementById('inv-count').textContent = data.count;
     document.querySelectorAll('#card-review input').forEach(el => {
@@ -661,10 +929,18 @@ async function confirmInvoice() {
       el.disabled = true;
     });
     document.getElementById('items-body').innerHTML = '';
+    await loadInvoices();
+    if (isEditing) document.getElementById('btn-run-agent').disabled = false;
+  } else {
+    const err = await res.json();
+    setMsg('msg-review', '儲存失敗：' + (err.detail || '未知錯誤'), 'err');
   }
 }
 
 function addAnotherInvoice() {
+  editingInvoiceIndex = null;
+  document.getElementById('btn-confirm-invoice').textContent = '確認此筆發票';
+  document.getElementById('btn-run-agent').disabled = true;
   document.querySelectorAll('#card-review input').forEach(el => el.disabled = false);
   document.getElementById('invoice-actions').style.display = 'none';
   setMsg('msg-review', '', '');
@@ -673,10 +949,14 @@ function addAnotherInvoice() {
   document.getElementById('card-upload').scrollIntoView({ behavior: 'smooth' });
 }
 
-function finishInvoices() {
+async function finishInvoices() {
   markDone(3);
   unlock('card-agent');
-  setMsg('msg-review', '發票皆已確認，請執行 Agent。', 'ok');
+  document.getElementById('btn-run-agent').disabled = false;
+  setMsg('msg-review', '發票皆已確認，正在自動啟動 Agent。', 'ok');
+  await loadInvoices();
+  document.getElementById('card-agent').scrollIntoView({behavior:'smooth'});
+  await runAgent(false);
 }
 
 function resetOcr() {
@@ -685,15 +965,19 @@ function resetOcr() {
   setMsg('msg-upload', '', '');
 }
 
-async function runAgent() {
+async function runAgent(manual = false) {
   document.getElementById('btn-run-agent').disabled = true;
-  document.getElementById('msg-agent').innerHTML = '<span class="spinner"></span>Agent 執行中，請勿關閉瀏覽器視窗...';
-  const res = await fetch('/api/run-agent', {method:'POST'});
+  document.getElementById('btn-manual-retry').disabled = true;
+  document.getElementById('agent-failure-actions').style.display = 'none';
+  document.getElementById('msg-agent').innerHTML = manual
+    ? '<span class="spinner"></span>手動重試中；若失敗仍可再次重試...'
+    : '<span class="spinner"></span>Agent 執行中；失敗時最多自動嘗試 3 次...';
+  const res = await fetch('/api/run-agent' + (manual ? '?manual=true' : ''), {method:'POST'});
   if (res.ok) {
     const data = await res.json();
     document.getElementById('report-number').textContent = data.report_number || '—';
     document.getElementById('msg-agent').className = 'msg ok';
-    document.getElementById('msg-agent').textContent = 'Agent 完成！';
+    document.getElementById('msg-agent').textContent = `Agent 完成！（共嘗試 ${data.attempts || 1} 次）`;
     document.getElementById('print-link-row').style.display = 'block';
     markDone(4);
     unlock('card-done');
@@ -702,6 +986,22 @@ async function runAgent() {
     document.getElementById('msg-agent').className = 'msg err';
     document.getElementById('msg-agent').textContent = 'Agent 錯誤：' + (err.detail || '未知');
     document.getElementById('btn-run-agent').disabled = false;
+    document.getElementById('btn-manual-retry').disabled = false;
+    document.getElementById('agent-failure-actions').style.display = 'block';
+  }
+}
+
+async function clearAndGoHome() {
+  if (!confirm('回主頁將清除本輪個人資料與發票，確定繼續？')) return;
+  try {
+    const res = await fetch('/api/wipe', {method:'POST'});
+    if (!res.ok) {
+      alert('資料清除失敗，為避免資料殘留，目前不會離開此頁。');
+      return;
+    }
+    window.location.href = '/';
+  } catch (err) {
+    alert('無法連線清除資料，為避免資料殘留，目前不會離開此頁。');
   }
 }
 
@@ -721,6 +1021,42 @@ async function wipeData() {
     }, 2000);
   }
 }
+
+async function restoreSessionState() {
+  try {
+    const res = await fetch('/api/session');
+    if (!res.ok) return;
+    const session = await res.json();
+    if (session.payee) {
+      markDone(1);
+      unlock('card-upload');
+      setMsg(
+        'msg-payee',
+        `已保留受款人：${session.payee.payee_name || ''}（${session.payee.payee_id_hint || ''}）。如需修改，請重新填寫完整資料。`,
+        'info'
+      );
+    }
+    currentInvoices = session.invoices || [];
+    renderInvoiceList();
+    if (currentInvoices.length) {
+      markDone(2);
+      markDone(3);
+      unlock('card-review');
+      unlock('card-agent');
+      document.getElementById('invoice-actions').style.display = 'block';
+    }
+    if (session.step === 'agent_done') {
+      markDone(4);
+      unlock('card-done');
+      document.getElementById('report-number').textContent = session.report_number || '—';
+      document.getElementById('print-link-row').style.display = 'block';
+    }
+  } catch (err) {
+    console.error('Unable to restore session state:', err);
+  }
+}
+
+restoreSessionState();
 </script>
 </body>
 </html>"""

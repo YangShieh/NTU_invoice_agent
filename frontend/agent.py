@@ -10,6 +10,7 @@ import subprocess
 import platform
 from openai import OpenAI
 from playwright.sync_api import sync_playwright, Page
+from diagnostics import error_details, log_event
 
 def _safe_accept(dialog):
     """Accept dialogs safely — prevents TargetClosedError if page navigates away."""
@@ -643,6 +644,32 @@ def dispatch_tool(page: Page, name: str, args: dict, payee: dict = None) -> str:
         case "print_receipt":          return print_receipt(page)
         case _:                        return "__TERMINAL__"
 
+
+def dispatch_tool_with_diagnostics(
+    page: Page, name: str, args: dict, payee: dict, case_id: str, step: int,
+    recovered_tool_call: bool = False,
+) -> str:
+    started = time.monotonic()
+    try:
+        result = dispatch_tool(page, name, args, payee)
+    except Exception as exc:
+        log_event(
+            case_id, f"agent.tool.{name}", "failed", step=step,
+            duration_ms=round((time.monotonic() - started) * 1000),
+            recovered_tool_call=recovered_tool_call,
+            **error_details(exc),
+        )
+        raise
+    log_event(
+        case_id, f"agent.tool.{name}",
+        "failed" if result.startswith("ERROR") else "completed",
+        step=step,
+        duration_ms=round((time.monotonic() - started) * 1000),
+        result=result if result.startswith("ERROR") else "OK",
+        recovered_tool_call=recovered_tool_call,
+    )
+    return result
+
 # ── Agent loop ────────────────────────────────────────────────────────────────
 
 def build_initial_message(cfg: dict, payee: dict, invoices: list) -> str:
@@ -678,7 +705,10 @@ PAYEE:
 
 Begin with get_page_state()."""
 
-def run_agent_loop(page: Page, llm: OpenAI, cfg: dict, payee: dict, invoices: list) -> str:
+def run_agent_loop(
+    page: Page, llm: OpenAI, cfg: dict, payee: dict, invoices: list,
+    case_id: str = "unassigned",
+) -> str:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user",   "content": build_initial_message(cfg, payee, invoices)},
@@ -688,14 +718,18 @@ def run_agent_loop(page: Page, llm: OpenAI, cfg: dict, payee: dict, invoices: li
     no_tool_call_streak = 0
 
     for step in range(30):
-        resp = llm.chat.completions.create(
-            model=cfg["agent_model"],
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            temperature=0,
-            max_tokens=512,
-        )
+        try:
+            resp = llm.chat.completions.create(
+                model=cfg["agent_model"],
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+                temperature=0,
+                max_tokens=512,
+            )
+        except Exception as exc:
+            log_event(case_id, "agent.llm", "failed", step=step + 1, **error_details(exc))
+            raise
         msg = resp.choices[0].message
         messages.append(msg.model_dump(exclude_unset=True))
 
@@ -706,14 +740,22 @@ def run_agent_loop(page: Page, llm: OpenAI, cfg: dict, payee: dict, invoices: li
             recovered = _try_parse_fake_tool_call(msg.content or "")
             if recovered:
                 name, args = recovered
-                print(f"  ⚠️  Recovered tool call: {name}({args})")
+                print(f"  ⚠️  Recovered tool call: {name}(fields={sorted(args)})")
                 if name == "report_done":
+                    log_event(case_id, "agent.report", "completed", step=step + 1)
                     return args.get("report_number", "")
                 if name == "report_error":
                     print(f"\n❌ Agent error: {args.get('reason')}")
+                    log_event(
+                        case_id, "agent.report", "failed", step=step + 1,
+                        reason=args.get("reason", "unspecified"),
+                    )
                     return ""
                 
-                result = dispatch_tool(page, name, args, payee)
+                result = dispatch_tool_with_diagnostics(
+                    page, name, args, payee, case_id, step + 1,
+                    recovered_tool_call=True,
+                )
                 print(f"     → {result[:120]}")
                 messages.append({"role": "user", "content": f"Tool result: {result}"})
                 no_tool_call_streak = 0
@@ -729,22 +771,30 @@ def run_agent_loop(page: Page, llm: OpenAI, cfg: dict, payee: dict, invoices: li
         for tc in msg.tool_calls:
             name = tc.function.name
             args = json.loads(tc.function.arguments or "{}")
-            print(f"  🔧 [{step+1}] {name}({json.dumps(args, ensure_ascii=False)})")
+            print(f"  🔧 [{step+1}] {name}(fields={sorted(args)})")
 
             if name == "report_done":
                 rn = args.get("report_number", "unknown")
                 print(f"\n✅ Done! Report: {rn}")
+                log_event(case_id, "agent.report", "completed", step=step + 1)
                 return rn
 
             if name == "report_error":
                 print(f"\n❌ Agent error: {args.get('reason')}")
+                log_event(
+                    case_id, "agent.report", "failed", step=step + 1,
+                    reason=args.get("reason", "unspecified"),
+                )
                 return ""
 
-            result = dispatch_tool(page, name, args, payee)
+            result = dispatch_tool_with_diagnostics(
+                page, name, args, payee, case_id, step + 1
+            )
             print(f"     → {result[:120]}")
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     print("⚠️  Max steps reached.")
+    log_event(case_id, "agent.loop", "failed", reason="max_steps_reached", max_steps=30)
     return ""
 
 
@@ -787,8 +837,7 @@ def auto_login(page: Page, cfg: dict) -> None:
     # 3. 讀取帳號密碼
     username = cfg.get("ntu_username", "")
     password = cfg.get("ntu_password", "")
-    print(f"   - Using username: {username}")
-    print(f"   - Using password: {password}")
+    print("   - Credentials loaded from config.json (values hidden)")
     if not username or not password:
         print("❌ 錯誤：在 config.json 中找不到 ntu_username 或 ntu_password")
         return
@@ -826,7 +875,10 @@ def auto_login(page: Page, cfg: dict) -> None:
 
 
 # 修改原有的 run_submission 函數
-def run_submission(cfg: dict, payee: dict, invoices: list, headless: bool = True) -> str:
+def run_submission(
+    cfg: dict, payee: dict, invoices: list, headless: bool = True,
+    case_id: str = "unassigned",
+) -> str:
     llm = OpenAI(base_url=cfg["agent_base_url"], api_key="not-needed")
     
     # Close any existing global session if running multiple times
@@ -845,8 +897,8 @@ def run_submission(cfg: dict, payee: dict, invoices: list, headless: bool = True
     auto_login(page, cfg)
     # ------------------------------------------
 
-    report_number = run_agent_loop(page, llm, cfg, payee, invoices)
-    _save_audit_log(report_number, invoices, payee)
+    report_number = run_agent_loop(page, llm, cfg, payee, invoices, case_id=case_id)
+    _save_audit_log(case_id, report_number, invoices)
 
     if report_number:
         print("✅ Agent finished. PDF ready for download.")
@@ -879,8 +931,9 @@ def continue_after_login(cfg: dict, payee: dict, invoices: list) -> str:
     # ──────────────────────────────────────────
 
     llm = OpenAI(base_url=cfg["agent_base_url"], api_key="not-needed")
-    report_number = run_agent_loop(page, llm, cfg, payee, invoices)
-    _save_audit_log(report_number, invoices, payee)
+    case_id = "unassigned"
+    report_number = run_agent_loop(page, llm, cfg, payee, invoices, case_id=case_id)
+    _save_audit_log(case_id, report_number, invoices)
     return report_number
 
 def close_browser() -> None:
@@ -888,26 +941,9 @@ def close_browser() -> None:
     if _state.get("pw"): _state["pw"].stop()
     _state["pw"], _state["browser"], _state["page"] = None, None, None
 
-def _save_audit_log(report_number: str, invoices: list, payee: dict) -> None:
+def _save_audit_log(case_id: str, report_number: str, invoices: list) -> None:
     if not report_number: return
-    
-    inv_nums = [inv.get("invoice_number", "") for inv in invoices]
-    try:
-        total_amt = sum(int(float(inv.get("total_amount", 0))) for inv in invoices)
-    except:
-        total_amt = 0
-
-    log = {
-        "timestamp":      time.strftime("%Y-%m-%d %H:%M:%S"),
-        "report_number":  report_number,
-        "invoice_numbers": inv_nums,
-        "total_amount":   total_amt,
-        "payee_id":       payee["payee_id"],
-        "payee_name":     payee["payee_name"],
-    }
-    log_path = f"audit_{time.strftime('%Y%m%d_%H%M%S')}.json"
-    with open(log_path, "w", encoding="utf-8") as f:
-        json.dump(log, f, ensure_ascii=False, indent=2)
+    log_event(case_id, "submission.audit", "completed", invoice_count=len(invoices))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -920,7 +956,13 @@ if __name__ == "__main__":
         session = json.load(f)
 
     if "invoices" in session:
-        run_submission(cfg, session["payee"], session["invoices"], headless=args.headless)
+        run_submission(
+            cfg, session["payee"], session["invoices"], headless=args.headless,
+            case_id=session.get("case_id", "unassigned"),
+        )
     else:
         # Fallback for old session.json
-        run_submission(cfg, session["payee"], [session["invoice"]], headless=args.headless)
+        run_submission(
+            cfg, session["payee"], [session["invoice"]], headless=args.headless,
+            case_id=session.get("case_id", "unassigned"),
+        )
