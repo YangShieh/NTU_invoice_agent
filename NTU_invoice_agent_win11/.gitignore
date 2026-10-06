@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Session & temp data
+session.json
+session_image.jpg
+*.png
+
+# Credentials (NEVER commit)
+config.json
+
+# SSL certs (auto-generated)
+cert.pem
+key.pem
+
+# Print output
+print_page.pdf
+print_page.html
+
+# Audit logs
+audit_*.json
+frontend/logs/
+backend/logs/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Electron
+electron/node_modules/
+electron/dist/

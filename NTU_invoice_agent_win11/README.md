@@ -1,8 +1,5 @@
 # NTU Invoice Agent System — 希望
 
-For a beginner-friendly Windows 11/WSL startup checklist, see
-[`START_HERE_WSL.md`](START_HERE_WSL.md).
-
 An intelligent, hybrid automation tool designed to streamline the invoice submission process for the legacy NTU Accounting System. By combining an intuitive web frontend, an advanced local Vision AI backend powered by vLLM, and a headless browser automation agent, this project drastically cuts down manual data entry and ensures high accuracy.
 
 ---
