@@ -1,5 +1,11 @@
 # NTU Invoice Agent System — 希望
 
+## Windows 11 一鍵啟動
+
+雙擊專案根目錄的 `START_WIN11.bat`。它會自動啟動並持續監控 WSL vLLM、OCR API、前端伺服器與 Electron；任何程序意外結束後都會自動重啟。
+
+預設 WSL distribution 與 Conda 環境名稱可在 `win11_supervisor.ps1` 的參數中調整。完整說明請參閱上一層的 `START_HERE_WSL.md`。
+
 An intelligent, hybrid automation tool designed to streamline the invoice submission process for the legacy NTU Accounting System. By combining an intuitive web frontend, an advanced local Vision AI backend powered by vLLM, and a headless browser automation agent, this project drastically cuts down manual data entry and ensures high accuracy.
 
 ---

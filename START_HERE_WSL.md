@@ -1,5 +1,39 @@
 # Start the NTU Invoice Agent (Windows 11 + WSL)
 
+## 一鍵啟動（建議）
+
+進入 `NTU_invoice_agent_win11` 資料夾，直接雙擊：
+
+```text
+START_WIN11.bat
+```
+
+啟動器會依序：
+
+1. 在 WSL 啟動 vLLM，等待 `8080` 連接埠。
+2. 啟動 OCR API，等待 `8000` 連接埠。
+3. 啟動前端伺服器，等待 `8001` 連接埠。
+4. 自動開啟 Electron 報帳畫面。
+
+啟動器視窗必須保持開啟。vLLM、OCR API、前端或 Electron 若意外關閉，會在數秒後自動重啟；關閉 Electron 視窗後也會再次開啟。
+
+預設使用：
+
+- WSL：`Ubuntu-22.04`
+- 後端 Conda 環境：`ntu-invoice-vllm`
+- 前端 Conda 環境：`invoice_frontend`
+
+若名稱不同，可從 PowerShell 手動指定：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\win11_supervisor.ps1 `
+  -WslDistro Ubuntu-22.04 `
+  -BackendCondaEnv ntu-invoice-vllm `
+  -FrontendCondaEnv invoice_frontend
+```
+
+以下三個 Terminal 步驟保留作為手動啟動／除錯方式。
+
 
 開啟 **POWERSHELL** 方法:
 1. win +r

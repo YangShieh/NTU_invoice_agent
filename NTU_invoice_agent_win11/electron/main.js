@@ -6,6 +6,8 @@ const https = require('https');
 const http = require('http');
 
 const SERVER_PORT = 8001;
+const EXTERNAL_SERVER =
+  process.env.NTU_EXTERNAL_FRONTEND === '1';
 
 // Leave null to use the default WSL distribution.
 // Otherwise, use the exact name shown by: wsl.exe --list --verbose
@@ -27,6 +29,7 @@ let isQuitting = false;
 let restartAttempts = 0;
 let restartTimer = null;
 let serverGeneration = 0;
+let externalServerWasReachable = true;
 
 function shellQuote(value) {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -463,7 +466,13 @@ app.on(
 );
 
 app.whenReady().then(async () => {
-  startServer();
+  if (!EXTERNAL_SERVER) {
+    startServer();
+  } else {
+    console.log(
+      'Using the frontend server managed by START_WIN11.bat.'
+    );
+  }
 
   try {
     const protocol = await waitForServer();
@@ -485,6 +494,32 @@ app.whenReady().then(async () => {
     app.quit();
   }
 });
+
+// When the batch supervisor restarts the external frontend, reload the
+// Electron window automatically as soon as port 8001 is healthy again.
+setInterval(async () => {
+  if (!EXTERNAL_SERVER || isQuitting) {
+    return;
+  }
+
+  try {
+    const protocol = await waitForServer(2);
+
+    if (
+      !externalServerWasReachable &&
+      mainWindow &&
+      !mainWindow.isDestroyed()
+    ) {
+      mainWindow.loadURL(
+        `${protocol}://localhost:${SERVER_PORT}/`
+      );
+    }
+
+    externalServerWasReachable = true;
+  } catch {
+    externalServerWasReachable = false;
+  }
+}, 3000);
 
 app.on('activate', async () => {
   if (BrowserWindow.getAllWindows().length !== 0) {
