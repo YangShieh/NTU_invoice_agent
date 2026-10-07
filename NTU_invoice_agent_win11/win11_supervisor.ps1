@@ -1,4 +1,5 @@
 param(
+    [string]$ProjectRoot = "",
     [string]$WslDistro = "Ubuntu-22.04",
     [string]$BackendCondaEnv = "ntu-invoice-vllm",
     [string]$FrontendCondaEnv = "invoice_frontend",
@@ -6,8 +7,22 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$SupervisorDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $ProjectRoot) {
+    $ProjectRoot = $SupervisorDirectory
+}
+$ProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot).Path
 $ElectronDir = Join-Path $ProjectRoot "electron"
+
+if (-not (Test-Path -LiteralPath (Join-Path $ProjectRoot "backend"))) {
+    throw "The selected project folder has no backend directory: $ProjectRoot"
+}
+if (-not (Test-Path -LiteralPath (Join-Path $ProjectRoot "frontend"))) {
+    throw "The selected project folder has no frontend directory: $ProjectRoot"
+}
+if (-not (Test-Path -LiteralPath $ElectronDir)) {
+    throw "The selected project folder has no electron directory: $ProjectRoot"
+}
 
 function Test-TcpPort {
     param([int]$Port)

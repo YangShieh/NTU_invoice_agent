@@ -9,6 +9,7 @@ import argparse, json, os, re, sys, time
 import tempfile
 import subprocess
 import platform
+import threading
 from openai import OpenAI
 from playwright.sync_api import sync_playwright, Page
 from diagnostics import error_details, log_event
@@ -588,6 +589,7 @@ def print_receipt(page: Page) -> str:
                             page.evaluate(f"window.open('{print_url}')")
                         download = download_info.value
                         download.save_as(pdf_path)
+                        _state["report_number"] = asn
                         print(f"🖨️ PDF downloaded to {pdf_path}")
 
                         # --- 新增：下載後自動開啟 PDF ---
@@ -612,6 +614,7 @@ def print_receipt(page: Page) -> str:
                                 print_btn.first.click(force=True)
                             download = download_info.value
                             download.save_as(pdf_path)
+                            _state["report_number"] = asn
                             print(f"🖨️ PDF downloaded (via button) to {pdf_path}")
 
                             # --- 新增：Fallback 也要自動開啟 PDF ---
@@ -646,14 +649,28 @@ def dispatch_tool(page: Page, name: str, args: dict, payee: dict = None) -> str:
         case _:                        return "__TERMINAL__"
 
 
+def resolved_report_number(candidate=None) -> str:
+    """Use the ASN captured from NTU; only fall back to the model argument."""
+    invalid_values = {"", "unknown", "none", "null", "not found", "n/a", "—"}
+    captured = str(_state.get("report_number") or "").strip()
+    if captured.lower() not in invalid_values:
+        return captured
+
+    value = str(candidate or "").strip()
+    return value if value.lower() not in invalid_values else ""
+
+
 def dispatch_tool_with_diagnostics(
     page: Page, name: str, args: dict, payee: dict, case_id: str, step: int,
     recovered_tool_call: bool = False,
 ) -> str:
     started = time.monotonic()
+    _state["last_tool"] = name
+    _state["last_tool_outcome"] = "started"
     try:
         result = dispatch_tool(page, name, args, payee)
     except Exception as exc:
+        _state["last_tool_outcome"] = "exception"
         log_event(
             case_id, f"agent.tool.{name}", "failed", step=step,
             duration_ms=round((time.monotonic() - started) * 1000),
@@ -661,6 +678,9 @@ def dispatch_tool_with_diagnostics(
             **error_details(exc),
         )
         raise
+    _state["last_tool_outcome"] = (
+        "failed" if result.startswith("ERROR") else "completed"
+    )
     log_event(
         case_id, f"agent.tool.{name}",
         "failed" if result.startswith("ERROR") else "completed",
@@ -743,8 +763,13 @@ def run_agent_loop(
                 name, args = recovered
                 print(f"  ⚠️  Recovered tool call: {name}(fields={sorted(args)})")
                 if name == "report_done":
-                    log_event(case_id, "agent.report", "completed", step=step + 1)
-                    return args.get("report_number", "")
+                    rn = resolved_report_number(args.get("report_number"))
+                    log_event(
+                        case_id, "agent.report", "completed" if rn else "failed",
+                        step=step + 1,
+                        reason=None if rn else "missing_report_number",
+                    )
+                    return rn
                 if name == "report_error":
                     print(f"\n❌ Agent error: {args.get('reason')}")
                     log_event(
@@ -775,9 +800,13 @@ def run_agent_loop(
             print(f"  🔧 [{step+1}] {name}(fields={sorted(args)})")
 
             if name == "report_done":
-                rn = args.get("report_number", "unknown")
+                rn = resolved_report_number(args.get("report_number"))
                 print(f"\n✅ Done! Report: {rn}")
-                log_event(case_id, "agent.report", "completed", step=step + 1)
+                log_event(
+                    case_id, "agent.report", "completed" if rn else "failed",
+                    step=step + 1,
+                    reason=None if rn else "missing_report_number",
+                )
                 return rn
 
             if name == "report_error":
@@ -793,6 +822,15 @@ def run_agent_loop(
             )
             print(f"     → {result[:120]}")
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+    recovered_number = resolved_report_number()
+    if recovered_number:
+        print("✅ Agent reached max steps after printing; using the captured ASN.")
+        log_event(
+            case_id, "agent.report", "completed",
+            reason="recovered_from_printed_asn", max_steps=30,
+        )
+        return recovered_number
 
     print("⚠️  Max steps reached.")
     log_event(case_id, "agent.loop", "failed", reason="max_steps_reached", max_steps=30)
@@ -875,51 +913,117 @@ def auto_login(page: Page, cfg: dict) -> None:
     time.sleep(1.0)
 
 
+_submission_lock = threading.Lock()
+
+
 # 修改原有的 run_submission 函數
 def run_submission(
     cfg: dict, payee: dict, invoices: list, headless: bool = True,
     case_id: str = "unassigned",
 ) -> str:
-    llm = OpenAI(base_url=cfg["agent_base_url"], api_key="not-needed")
+    if not _submission_lock.acquire(blocking=False):
+        raise RuntimeError("另一個 Agent 任務正在執行，請稍候再試。")
 
-    # Close any existing global session if running multiple times
-    close_browser()
+    pw = None
+    browser = None
+    context = None
+    page = None
+    owner_thread_id = threading.get_ident()
+    try:
+        llm = OpenAI(base_url=cfg["agent_base_url"], api_key="not-needed")
+        _state.pop("report_number", None)
+        _state.pop("print_url", None)
+        _state.pop("last_tool", None)
+        _state.pop("last_tool_outcome", None)
+        _state["close_requested"] = False
 
-    pw = sync_playwright().start()
-    browser = pw.chromium.launch(headless=True)
-    context = browser.new_context(accept_downloads=True, ignore_https_errors=True)
-    page = context.new_page()
+        # Playwright's synchronous API is thread-affine. Create, use, and close
+        # every object inside this request thread; a later retry must never clean
+        # up objects that belong to an earlier request thread.
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context(accept_downloads=True, ignore_https_errors=True)
+        page = context.new_page()
+        _state.update({
+            "pw": pw,
+            "browser": browser,
+            "context": context,
+            "page": page,
+            "owner_thread_id": owner_thread_id,
+        })
 
-    _state["pw"], _state["browser"], _state["page"] = pw, browser, page
+        print("🌐 Opening NTU accounting system (background)...")
+        auto_login(page, cfg)
 
-    print("🌐 Opening NTU accounting system (background)...")
+        report_number = resolved_report_number(
+            run_agent_loop(page, llm, cfg, payee, invoices, case_id=case_id)
+        )
+        _save_audit_log(case_id, report_number, invoices)
 
-    # --- 替換掉原本的手動輸入，改為自動登入 ---
-    auto_login(page, cfg)
-    # ------------------------------------------
+        if report_number:
+            print("✅ Agent finished. PDF ready for download.")
+        else:
+            print("⚠️ Agent failed.")
+        return report_number
+    finally:
+        # Cleanup must happen on the same thread that created Playwright.
+        for resource, method_name in (
+            (context, "close"),
+            (browser, "close"),
+            (pw, "stop"),
+        ):
+            if resource is not None:
+                try:
+                    getattr(resource, method_name)()
+                except Exception as cleanup_error:
+                    print(f"⚠️ Browser cleanup warning: {cleanup_error}")
 
-    report_number = run_agent_loop(page, llm, cfg, payee, invoices, case_id=case_id)
-    _save_audit_log(case_id, report_number, invoices)
+        if _state.get("owner_thread_id") == owner_thread_id:
+            _state.update({
+                "pw": None,
+                "browser": None,
+                "context": None,
+                "page": None,
+                "owner_thread_id": None,
+                "close_requested": False,
+            })
+        _submission_lock.release()
 
-    if report_number:
-        print("✅ Agent finished. PDF ready for download.")
-        close_browser()
-    else:
-        print("⚠️ Agent failed.")
-
-    return report_number
-
-_state = {"pw": None, "browser": None, "page": None}
+_state = {
+    "pw": None,
+    "browser": None,
+    "context": None,
+    "page": None,
+    "owner_thread_id": None,
+    "close_requested": False,
+    "report_number": None,
+    "print_url": None,
+    "last_tool": None,
+    "last_tool_outcome": None,
+}
 
 def open_browser_for_login() -> None:
     pw = sync_playwright().start()
     browser = pw.chromium.launch(headless=False)
-    page = browser.new_context(accept_downloads=True, ignore_https_errors=True).new_page()
+    context = browser.new_context(accept_downloads=True, ignore_https_errors=True)
+    page = context.new_page()
     page.goto("https://ntuacc.cc.ntu.edu.tw/acc/")
-    _state["pw"], _state["browser"], _state["page"] = pw, browser, page
+    _state.update({
+        "pw": pw,
+        "browser": browser,
+        "context": context,
+        "page": page,
+        "owner_thread_id": threading.get_ident(),
+        "close_requested": False,
+    })
 
 def continue_after_login(cfg: dict, payee: dict, invoices: list) -> str:
     """Step B — called after the user confirms login is done in the browser window."""
+    owner_thread_id = _state.get("owner_thread_id")
+    if owner_thread_id is not None and owner_thread_id != threading.get_ident():
+        raise RuntimeError(
+            "登入瀏覽器屬於另一個執行緒，請關閉後改用自動登入重試。"
+        )
     page = _state.get("page")
     if page is None:
         raise RuntimeError("No browser session open. Call open_browser_for_login() first.")
@@ -933,14 +1037,41 @@ def continue_after_login(cfg: dict, payee: dict, invoices: list) -> str:
 
     llm = OpenAI(base_url=cfg["agent_base_url"], api_key="not-needed")
     case_id = "unassigned"
-    report_number = run_agent_loop(page, llm, cfg, payee, invoices, case_id=case_id)
+    _state.pop("report_number", None)
+    _state.pop("print_url", None)
+    report_number = resolved_report_number(
+        run_agent_loop(page, llm, cfg, payee, invoices, case_id=case_id)
+    )
     _save_audit_log(case_id, report_number, invoices)
     return report_number
 
 def close_browser() -> None:
-    if _state.get("browser"): _state["browser"].close()
-    if _state.get("pw"): _state["pw"].stop()
-    _state["pw"], _state["browser"], _state["page"] = None, None, None
+    owner_thread_id = _state.get("owner_thread_id")
+    if owner_thread_id is not None and owner_thread_id != threading.get_ident():
+        # Playwright sync objects cannot be touched from another FastAPI worker.
+        # Their owner always performs cleanup in run_submission's finally block.
+        _state["close_requested"] = True
+        return
+
+    for key, method_name in (
+        ("context", "close"),
+        ("browser", "close"),
+        ("pw", "stop"),
+    ):
+        resource = _state.get(key)
+        if resource is not None:
+            try:
+                getattr(resource, method_name)()
+            except Exception as cleanup_error:
+                print(f"⚠️ Browser cleanup warning: {cleanup_error}")
+    _state.update({
+        "pw": None,
+        "browser": None,
+        "context": None,
+        "page": None,
+        "owner_thread_id": None,
+        "close_requested": False,
+    })
 
 def _save_audit_log(case_id: str, report_number: str, invoices: list) -> None:
     if not report_number: return

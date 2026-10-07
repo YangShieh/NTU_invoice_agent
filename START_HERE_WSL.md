@@ -2,11 +2,23 @@
 
 ## 一鍵啟動（建議）
 
-進入 `NTU_invoice_agent_win11` 資料夾，直接雙擊：
+可以把 `START_WIN11.bat` 複製到 Windows 桌面後直接雙擊：
 
 ```text
 START_WIN11.bat
 ```
+
+batch 會尋找桌面上的固定專案目錄：
+
+- `Desktop\NTU_invoice_agent`
+
+如果專案放在其他位置，先在 Command Prompt 執行一次：
+
+```bat
+setx NTU_INVOICE_AGENT_DIR "D:\你的路徑\NTU_invoice_agent"
+```
+
+重新開啟 Command Prompt 或重新登入 Windows 後，桌面的 batch 就會使用該路徑。
 
 啟動器會依序：
 

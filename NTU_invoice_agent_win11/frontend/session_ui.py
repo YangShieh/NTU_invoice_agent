@@ -264,7 +264,7 @@ def run_agent_endpoint(manual: bool = False):
         raise HTTPException(400, f"Invoice not confirmed yet（案件 ID: {case_id}）")
 
     cfg = load_config()
-    from agent import run_submission, _state
+    from agent import close_browser, run_submission, _state
     started = time.monotonic()
     max_attempts = 1 if manual else 3
     log_event(
@@ -296,8 +296,16 @@ def run_agent_endpoint(manual: bool = False):
                 session["invoices"],
                 **run_kwargs,
             )
+            report_number = str(
+                report_number or _state.get("report_number") or ""
+            ).strip()
             if not report_number:
-                raise RuntimeError("Agent ended without a report number")
+                last_tool = _state.get("last_tool") or "unknown"
+                last_outcome = _state.get("last_tool_outcome") or "unknown"
+                raise RuntimeError(
+                    "Agent stopped before NTU produced a report number. "
+                    f"Last step: {last_tool} ({last_outcome})"
+                )
             completed_attempt = attempt
             log_event(
                 case_id, "agent.attempt", "completed", attempt=attempt,
@@ -305,13 +313,27 @@ def run_agent_endpoint(manual: bool = False):
             )
             break
         except Exception as exc:
+            captured_number = str(_state.get("report_number") or "").strip()
+            if captured_number:
+                report_number = captured_number
+                completed_attempt = attempt
+                log_event(
+                    case_id, "agent.attempt", "completed", attempt=attempt,
+                    duration_ms=round((time.monotonic() - attempt_started) * 1000),
+                    recovery="captured_ntu_asn_after_agent_error",
+                )
+                try:
+                    close_browser()
+                except Exception:
+                    pass
+                break
+
             last_error = exc
             log_event(
                 case_id, "agent.attempt", "failed", attempt=attempt,
                 duration_ms=round((time.monotonic() - attempt_started) * 1000),
                 **error_details(exc),
             )
-            from agent import close_browser
             try:
                 close_browser()
             except Exception:
