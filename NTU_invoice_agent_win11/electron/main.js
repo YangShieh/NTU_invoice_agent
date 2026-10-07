@@ -333,6 +333,47 @@ function waitForServer(retries = 60) {
   });
 }
 
+function clearSessionData(protocol) {
+  const transport = protocol === 'https' ? https : http;
+
+  return new Promise((resolve, reject) => {
+    const request = transport.request(
+      {
+        hostname: 'localhost',
+        port: SERVER_PORT,
+        path: '/api/wipe',
+        method: 'POST',
+        rejectUnauthorized: false
+      },
+      response => {
+        response.resume();
+
+        if (
+          response.statusCode >= 200 &&
+          response.statusCode < 300
+        ) {
+          resolve();
+          return;
+        }
+
+        reject(
+          new Error(
+            `Data cleanup returned HTTP ${response.statusCode}`
+          )
+        );
+      }
+    );
+
+    request.on('error', reject);
+    request.setTimeout(5000, () => {
+      request.destroy(
+        new Error('Data cleanup timed out')
+      );
+    });
+    request.end();
+  });
+}
+
 function createWindow(protocol) {
   mainWindow = new BrowserWindow({
     width: 480,
@@ -482,11 +523,26 @@ app.whenReady().then(async () => {
       `${protocol}://localhost:${SERVER_PORT}`
     );
 
+    // Every Electron process starts a brand-new round. Clear any data left by
+    // a normal close, crash, forced termination, or previous machine restart
+    // before a BrowserWindow can display the application.
+    await clearSessionData(protocol);
+    writeDiagnostic(
+      'desktop.startup_cleanup',
+      'completed'
+    );
+
     createWindow(protocol);
   } catch (error) {
     console.error(
-      'Failed to start server:',
+      'Failed to initialize a clean session:',
       error
+    );
+
+    writeDiagnostic(
+      'desktop.startup_cleanup',
+      'failed',
+      { error: String(error) }
     );
 
     isQuitting = true;

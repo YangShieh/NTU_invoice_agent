@@ -739,6 +739,8 @@ def run_agent_loop(
     no_tool_call_streak = 0
 
     for step in range(30):
+        if _state.get("close_requested"):
+            raise RuntimeError("Agent cancelled because the session was cleared.")
         try:
             resp = llm.chat.completions.create(
                 model=cfg["agent_model"],
@@ -751,6 +753,8 @@ def run_agent_loop(
         except Exception as exc:
             log_event(case_id, "agent.llm", "failed", step=step + 1, **error_details(exc))
             raise
+        if _state.get("close_requested"):
+            raise RuntimeError("Agent cancelled because the session was cleared.")
         msg = resp.choices[0].message
         messages.append(msg.model_dump(exclude_unset=True))
 
@@ -795,6 +799,8 @@ def run_agent_loop(
 
         no_tool_call_streak = 0
         for tc in msg.tool_calls:
+            if _state.get("close_requested"):
+                raise RuntimeError("Agent cancelled because the session was cleared.")
             name = tc.function.name
             args = json.loads(tc.function.arguments or "{}")
             print(f"  🔧 [{step+1}] {name}(fields={sorted(args)})")

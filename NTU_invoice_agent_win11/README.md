@@ -2,7 +2,7 @@
 
 ## Windows 11 一鍵啟動
 
-可將 `START_WIN11.bat` 複製到 Windows 桌面後雙擊，並將實際專案資料夾命名為 `NTU_invoice_agent`、放在同一個桌面。啟動器會自動啟動並持續監控 WSL vLLM、OCR API、前端伺服器與 Electron；任何程序意外結束後都會自動重啟。
+可將 `START_WIN11.bat` 複製到 Windows 桌面後雙擊，並將實際專案資料夾命名為 `NTU_invoice_agent`、放在同一個桌面。啟動器會自動啟動並持續監控 WSL vLLM、OCR API、前端伺服器與 Electron；任何程序意外結束後都會自動重啟。Electron 每次啟動時會先清除上一輪資料，再從主頁開始。
 
 預設 WSL distribution 與 Conda 環境名稱可在 `win11_supervisor.ps1` 的參數中調整。完整說明請參閱上一層的 `START_HERE_WSL.md`。
 

@@ -25,7 +25,7 @@ setx NTU_INVOICE_AGENT_DIR "D:\你的路徑\NTU_invoice_agent"
 1. 在 WSL 啟動 vLLM，等待 `8080` 連接埠。
 2. 啟動 OCR API，等待 `8000` 連接埠。
 3. 啟動前端伺服器，等待 `8001` 連接埠。
-4. 自動開啟 Electron 報帳畫面。
+4. 清除上一輪的個資、發票影像與列印檔後，從主頁開啟 Electron 報帳畫面。
 
 啟動器視窗必須保持開啟。vLLM、OCR API、前端或 Electron 若意外關閉，會在數秒後自動重啟；關閉 Electron 視窗後也會再次開啟。
 

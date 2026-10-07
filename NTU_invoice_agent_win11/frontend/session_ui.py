@@ -86,7 +86,15 @@ def ensure_case_id(session: dict) -> str:
 
 def wipe_session():
     """Remove all personal data from disk."""
-    for path in [SESSION_FILE, TEMP_IMAGE, "print_page.pdf"]:
+    private_paths = [
+        SESSION_FILE,
+        TEMP_IMAGE,
+        "print_page.pdf",
+        "print_page.html",
+        "login_debug_after.png",
+        "login_debug_error.png",
+    ]
+    for path in private_paths:
         if os.path.exists(path):
             # Overwrite with zeros before deleting (basic privacy)
             with open(path, "wb") as f:
@@ -109,10 +117,24 @@ class InvoiceData(BaseModel):
     items: list
     expense_purpose: str
 
+
+def ensure_editable_before_agent(session: dict, case_id: str) -> None:
+    """Invoice/payee data becomes immutable once the Agent has started."""
+    if session.get("step") in {"agent_running", "agent_failed", "agent_done"}:
+        log_event(
+            case_id, "session.edit", "failed",
+            reason="agent_already_started", step=session.get("step"),
+        )
+        raise HTTPException(
+            409,
+            f"Agent 已開始執行，本輪資料已鎖定（案件 ID: {case_id}）",
+        )
+
 @app.post("/api/payee")
 def save_payee(p: PayeeInfo):
     session = load_session()
     case_id = ensure_case_id(session)
+    ensure_editable_before_agent(session, case_id)
     session["payee"] = p.model_dump()
     # Editing personal data must not discard already-confirmed invoices.
     session["step"] = "invoice_confirmed" if session.get("invoices") else "payee_saved"
@@ -124,6 +146,7 @@ def save_payee(p: PayeeInfo):
 async def upload_image(file: UploadFile = File(...)):
     session = load_session()
     case_id = ensure_case_id(session)
+    ensure_editable_before_agent(session, case_id)
     save_session(session)
     started = time.monotonic()
     # Save image to temp path
@@ -192,6 +215,7 @@ def confirm_invoice(data: InvoiceData):
     """User has reviewed/edited the OCR data — save final version."""
     session = load_session()
     case_id = ensure_case_id(session)
+    ensure_editable_before_agent(session, case_id)
     original = session.get("invoice", {})
     submitted = data.model_dump()
     changed_fields = [
@@ -219,6 +243,7 @@ def list_invoices():
 def update_invoice(invoice_index: int, data: InvoiceData):
     session = load_session()
     case_id = ensure_case_id(session)
+    ensure_editable_before_agent(session, case_id)
     invoices = session.get("invoices", [])
     if invoice_index < 0 or invoice_index >= len(invoices):
         raise HTTPException(404, f"找不到指定發票（案件 ID: {case_id}）")
@@ -259,9 +284,13 @@ def run_agent_endpoint(manual: bool = False):
     if "payee" not in session or "invoices" not in session or not session["invoices"]:
         log_event(case_id, "agent.validation", "failed", reason="missing_payee_or_invoices")
         raise HTTPException(400, f"Missing payee or invoices data in session（案件 ID: {case_id}）")
-    if session.get("step") != "invoice_confirmed":
+    allowed_steps = {"agent_failed"} if manual else {"invoice_confirmed"}
+    if session.get("step") not in allowed_steps:
         log_event(case_id, "agent.validation", "failed", reason="invoice_not_confirmed")
         raise HTTPException(400, f"Invoice not confirmed yet（案件 ID: {case_id}）")
+
+    session["step"] = "agent_running"
+    save_session(session)
 
     cfg = load_config()
     from agent import close_browser, run_submission, _state
@@ -344,6 +373,9 @@ def run_agent_endpoint(manual: bool = False):
     try:
         if not report_number:
             raise last_error or RuntimeError("Agent failed")
+        current_session = load_session()
+        if current_session.get("case_id") != case_id:
+            raise RuntimeError("Session was cleared while the Agent was running")
         session["step"] = "agent_done"
         session["report_number"] = report_number
         save_session(session)
@@ -359,11 +391,18 @@ def run_agent_endpoint(manual: bool = False):
             "attempts": completed_attempt,
         }
     except Exception as e:
+        current_session = load_session()
+        session_was_cleared = current_session.get("case_id") != case_id
+        if not session_was_cleared:
+            session["step"] = "agent_failed"
+            save_session(session)
         log_event(
             case_id, "agent.run", "failed",
             duration_ms=round((time.monotonic() - started) * 1000),
             **error_details(e),
         )
+        if session_was_cleared:
+            raise HTTPException(409, "Session was cleared while the Agent was running")
         raise HTTPException(500, f"{e}（案件 ID: {case_id}）")
 
 @app.post("/api/close-browser")
@@ -605,10 +644,13 @@ textarea{resize:vertical;min-height:50px}
   </div>
   <div id="msg-review"></div>
   <div id="invoice-actions" style="display:none; margin-top:15px; padding-top:15px; border-top:1px solid #eee;">
-    <p style="font-size:13px; margin-bottom:10px;">目前已確認 <strong id="inv-count">0</strong> 筆發票。</p>
+    <label>本輪已確認發票（Agent 執行前可編輯）</label>
+    <div class="invoice-list" id="confirmed-invoice-list"></div>
+    <p style="font-size:13px; margin-bottom:10px;">目前已確認 <strong id="inv-count">0</strong> 筆發票。請先完成所有修改，再啟動 Agent。</p>
     <div class="btn-row">
       <button class="btn btn-ghost" onclick="addAnotherInvoice()">新增另一筆發票</button>
-      <button class="btn btn-primary" onclick="finishInvoices()">全部確認並自動執行 Agent</button>
+      <button class="btn btn-ghost" onclick="backToPayee()">修改個人資料</button>
+      <button class="btn btn-primary" id="btn-finish-invoices" onclick="finishInvoices()">確認資料並自動執行 Agent</button>
     </div>
   </div>
 </div>
@@ -616,15 +658,9 @@ textarea{resize:vertical;min-height:50px}
 <!-- Step 4: Login + Agent running -->
 <div class="card locked" id="card-agent">
   <h2><span class="step-badge" id="badge-4">4</span>登入並執行 Agent</h2>
-  <div>
-    <label>本輪已確認發票</label>
-    <div class="invoice-list" id="agent-invoice-list"></div>
-  </div>
-  <p style="font-size:13px;color:#555">全部發票確認後，系統會自動登入並執行報帳任務。</p>
+  <p style="font-size:13px;color:#555">Agent 已使用上一步確認的資料開始報帳，執行期間不可再修改。</p>
   <div class="btn-row">
     <button class="btn btn-primary" id="btn-run-agent" onclick="runAgent()" style="display:none">執行 Agent</button>
-    <button class="btn btn-ghost" onclick="backToInvoices()">回上一步修改發票</button>
-    <button class="btn btn-ghost" onclick="backToPayee()">修改個人資料</button>
     <button class="btn btn-ghost" onclick="goHome()">回主頁並清除資料</button>
   </div>
   <div id="msg-agent" style="margin-top:10px"></div>
@@ -654,6 +690,7 @@ textarea{resize:vertical;min-height:50px}
 <script>
 let currentInvoices = [];
 let editingInvoiceIndex = null;
+let agentStarted = false;
 const unlock = id => document.getElementById(id).classList.remove('locked');
 const setMsg = (id, text, type) => {
   const el = document.getElementById(id);
@@ -665,6 +702,12 @@ const markDone = n => {
   b.textContent = '✓';
   b.classList.add('done');
 };
+
+function lockInputsForAgent() {
+  ['card-payee', 'card-upload', 'card-review'].forEach(id => {
+    document.getElementById(id).classList.add('locked');
+  });
+}
 
 async function savePayee() {
   const body = {
@@ -694,17 +737,11 @@ function goHome() {
 }
 
 function backToPayee() {
+  if (agentStarted) return;
   unlock('card-payee');
   document.getElementById('btn-run-agent').disabled = true;
   document.getElementById('card-payee').scrollIntoView({behavior:'smooth'});
   setMsg('msg-payee', '可直接修改資料，再按「儲存並繼續」。', 'info');
-}
-
-function backToInvoices() {
-  unlock('card-upload');
-  unlock('card-review');
-  document.getElementById('card-review').scrollIntoView({behavior:'smooth'});
-  setMsg('msg-review', '請從 Agent 上方的發票清單選擇「編輯」，或新增另一筆發票。', 'info');
 }
 
 function handleDrop(e) {
@@ -881,7 +918,7 @@ async function loadInvoices() {
 }
 
 function renderInvoiceList() {
-  const list = document.getElementById('agent-invoice-list');
+  const list = document.getElementById('confirmed-invoice-list');
   list.innerHTML = '';
   currentInvoices.forEach((invoice, index) => {
     const row = document.createElement('div');
@@ -896,6 +933,7 @@ function renderInvoiceList() {
     const edit = document.createElement('button');
     edit.className = 'btn btn-ghost';
     edit.textContent = '編輯';
+    edit.disabled = agentStarted;
     edit.onclick = () => editInvoice(index);
     row.append(main, edit);
     list.appendChild(row);
@@ -910,6 +948,7 @@ function renderInvoiceList() {
 }
 
 function editInvoice(index) {
+  if (agentStarted) return;
   const invoice = currentInvoices[index];
   if (!invoice) return;
   editingInvoiceIndex = index;
@@ -981,6 +1020,7 @@ async function confirmInvoice() {
 }
 
 function addAnotherInvoice() {
+  if (agentStarted) return;
   editingInvoiceIndex = null;
   document.getElementById('btn-confirm-invoice').textContent = '確認此筆發票';
   document.getElementById('btn-run-agent').disabled = true;
@@ -993,6 +1033,18 @@ function addAnotherInvoice() {
 }
 
 async function finishInvoices() {
+  if (agentStarted) return;
+  if (editingInvoiceIndex !== null) {
+    setMsg('msg-review', '請先儲存目前的發票修改。', 'err');
+    return;
+  }
+  if (!currentInvoices.length) {
+    setMsg('msg-review', '請先確認至少一筆發票。', 'err');
+    return;
+  }
+  agentStarted = true;
+  lockInputsForAgent();
+  document.getElementById('btn-finish-invoices').disabled = true;
   markDone(3);
   unlock('card-agent');
   document.getElementById('btn-run-agent').disabled = false;
@@ -1080,13 +1132,27 @@ async function restoreSessionState() {
       );
     }
     currentInvoices = session.invoices || [];
+    agentStarted = ['agent_running', 'agent_failed', 'agent_done'].includes(session.step);
     renderInvoiceList();
     if (currentInvoices.length) {
       markDone(2);
       markDone(3);
-      unlock('card-review');
-      unlock('card-agent');
       document.getElementById('invoice-actions').style.display = 'block';
+      if (agentStarted) {
+        lockInputsForAgent();
+        unlock('card-agent');
+        document.getElementById('btn-finish-invoices').disabled = true;
+      } else {
+        unlock('card-review');
+      }
+    }
+    if (session.step === 'agent_running') {
+      setMsg('msg-agent', 'Agent 執行中，本輪發票與個人資料已鎖定。', 'info');
+    }
+    if (session.step === 'agent_failed') {
+      setMsg('msg-agent', 'Agent 上次執行失敗，可手動重試或清除資料回主頁。', 'err');
+      document.getElementById('agent-failure-actions').style.display = 'block';
+      document.getElementById('btn-manual-retry').disabled = false;
     }
     if (session.step === 'agent_done') {
       markDone(4);
