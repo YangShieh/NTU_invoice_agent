@@ -7,23 +7,58 @@ echo   NTU Invoice Agent - Windows 11 one-click launcher
 echo ============================================================
 echo.
 
-rem The batch file is intended to sit on the Windows Desktop beside a project
-rem folder named NTU_invoice_agent.
+rem Resolve the project folder in this order:
+rem   1. NTU_INVOICE_AGENT_DIR environment variable
+rem   2. The folder containing this BAT file
+rem   3. NTU_invoice_agent beside this BAT file
+rem   4. %%USERPROFILE%%\Desktop\NTU_invoice_agent
 set "PROJECT_DIR="
 
 if defined NTU_INVOICE_AGENT_DIR (
   if exist "%NTU_INVOICE_AGENT_DIR%\win11_supervisor.ps1" (
-    set "PROJECT_DIR=%NTU_INVOICE_AGENT_DIR%"
+    if exist "%NTU_INVOICE_AGENT_DIR%\backend\" (
+      if exist "%NTU_INVOICE_AGENT_DIR%\frontend\" (
+        if exist "%NTU_INVOICE_AGENT_DIR%\electron\" (
+          set "PROJECT_DIR=%NTU_INVOICE_AGENT_DIR%"
+        )
+      )
+    )
   )
 )
 
 if not defined PROJECT_DIR (
-  if exist "%~dp0win11_supervisor.ps1" set "PROJECT_DIR=%~dp0"
+  if exist "%~dp0win11_supervisor.ps1" (
+    if exist "%~dp0backend\" (
+      if exist "%~dp0frontend\" (
+        if exist "%~dp0electron\" (
+          set "PROJECT_DIR=%~dp0"
+        )
+      )
+    )
+  )
 )
 
 if not defined PROJECT_DIR (
   if exist "%~dp0NTU_invoice_agent\win11_supervisor.ps1" (
-    set "PROJECT_DIR=%~dp0NTU_invoice_agent"
+    if exist "%~dp0NTU_invoice_agent\backend\" (
+      if exist "%~dp0NTU_invoice_agent\frontend\" (
+        if exist "%~dp0NTU_invoice_agent\electron\" (
+          set "PROJECT_DIR=%~dp0NTU_invoice_agent"
+        )
+      )
+    )
+  )
+)
+
+if not defined PROJECT_DIR (
+  if exist "%USERPROFILE%\Desktop\NTU_invoice_agent\win11_supervisor.ps1" (
+    if exist "%USERPROFILE%\Desktop\NTU_invoice_agent\backend\" (
+      if exist "%USERPROFILE%\Desktop\NTU_invoice_agent\frontend\" (
+        if exist "%USERPROFILE%\Desktop\NTU_invoice_agent\electron\" (
+          set "PROJECT_DIR=%USERPROFILE%\Desktop\NTU_invoice_agent"
+        )
+      )
+    )
   )
 )
 
