@@ -581,7 +581,7 @@ textarea{resize:vertical;min-height:50px}
       <select id="p-bcode">
         <option value="008">華南 (008)</option>
         <option value="808">玉山 (808)</option>
-        <option value="700">郵局 (700)</option>
+        <option value="7000021">郵局 (7000021)</option>
       </select>
     </div>
     <div class="full"><label>存款帳號 *</label><input id="p-acct" placeholder="00012345678" autocomplete="off"></div>

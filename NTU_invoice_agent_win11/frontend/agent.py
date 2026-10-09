@@ -451,93 +451,83 @@ def add_payee(page: Page, payee_id: str, note: str, amount: str, payee: dict = N
                 try:
                     print("⚠️ Payee not found, opening new tab to add payee...")
                     new_page = page.context.new_page()
-                    new_page.goto("https://ntuacc.cc.ntu.edu.tw/acc/main.asp")
-                    new_page.wait_for_load_state("networkidle")
-                    time.sleep(1.0)
+                    new_page.goto(
+                        "https://ntuacc.cc.ntu.edu.tw/acc/apply/manufedit.asp?act=ins",
+                        wait_until="domcontentloaded",
+                    )
 
-                    # 嘗試 hover 報帳管理以觸發下拉選單 (如果是 CSS Menu)
+                    # Fill the exact form fields from manufedit.asp?act=ins.
+                    success_fill = False
                     for frame in new_page.frames:
+                        form = frame.locator("form[name='form1']")
+                        id_input = frame.locator("input[name='ID']")
+                        if form.count() == 0 or id_input.count() == 0:
+                            continue
+
+                        bank_code = str(payee.get("bank_code", "")).strip()
+                        account_number = str(payee.get("account_number", "")).strip()
+                        bank_name_map = {
+                            "008": "華南商業銀行",
+                            "808": "玉山商業銀行",
+                            "7000021": "郵政存簿儲金",
+                        }
+                        bank_name = bank_name_map.get(bank_code, "")
+                        if not bank_name:
+                            return f"ERROR: 不支援的銀行代碼: {bank_code}"
+                        if bank_code == "7000021" and not re.fullmatch(r"\d{14}", account_number):
+                            return "ERROR: 郵局存款帳號必須為 14 碼數字。"
+
+                        id_input.first.fill(str(payee.get("payee_id", "")).strip())
+                        frame.locator("input[name='MNAME']").first.fill(
+                            str(payee.get("payee_name", "")).strip()
+                        )
+
+                        # BANKCODE is readonly. Assign both bank fields and fire
+                        # input/change events so the legacy form sees the values.
+                        for field_name, value in (
+                            ("BANKCODE", bank_code),
+                            ("BANKNAME", bank_name),
+                        ):
+                            frame.locator(f"input[name='{field_name}']").first.evaluate(
+                                """(node, value) => {
+                                    node.value = value;
+                                    node.dispatchEvent(new Event('input', {bubbles: true}));
+                                    node.dispatchEvent(new Event('change', {bubbles: true}));
+                                }""",
+                                value,
+                            )
+
+                        frame.locator("input[name='ACCNO']").first.fill(account_number)
+
+                        submit_dialogs = []
+                        def handle_submit_dialog(dialog):
+                            submit_dialogs.append(dialog.message)
+                            _safe_accept(dialog)
+
+                        new_page.on("dialog", handle_submit_dialog)
+                        frame.locator("input[name='Submit'][value='送出']").first.click()
                         try:
-                            menu_item = frame.locator("text='報帳管理'")
-                            if menu_item.count() > 0:
-                                menu_item.first.hover(timeout=2000)
-                                time.sleep(0.5)
-                        except:
+                            new_page.wait_for_load_state("networkidle", timeout=5000)
+                        except Exception:
                             pass
-
-                    # 尋找並點擊/選擇 受款人管理
-                    found_menu = False
-                    for frame in new_page.frames:
-                        payee_mgr_btn = frame.locator("a:has-text('受款人管理'), button:has-text('受款人管理')")
-                        if payee_mgr_btn.count() > 0:
-                            payee_mgr_btn.first.click(force=True, timeout=5000)
-                            found_menu = True
-                            break
-
-                        # 若為選單 (select) - 例如報帳管理是一個 select，受款人管理是裡面的 option
-                        payee_select = frame.locator("select:has(option:has-text('受款人管理'))")
-                        if payee_select.count() > 0:
-                            payee_select.first.select_option(label="受款人管理")
-                            try:
-                                frame.evaluate("if(typeof change === 'function') change();")
-                            except: pass
-                            found_menu = True
-                            break
-
-                    if found_menu:
-                        new_page.wait_for_load_state("networkidle")
                         time.sleep(1.0)
+                        new_page.remove_listener("dialog", handle_submit_dialog)
 
-                        # 點擊 新增 (+)
-                        found_add = False
-                        for frame in new_page.frames:
-                            # 根據使用者提供的 HTML: <img src="/acc/image/insert.gif" alt="新增" ...>
-                            add_plus_btn = frame.locator("img[src*='insert.gif'], img[alt='新增'], input[value*='+'], input[value*='＋'], button:has-text('+'), button:has-text('＋'), a:has-text('+'), img[src*='add'], img[src*='plus']")
-                            if add_plus_btn.count() > 0:
-                                add_plus_btn.first.click(force=True, timeout=5000)
-                                found_add = True
-                                break
-                            else:
-                                fallback = frame.locator("text='新增'")
-                                if fallback.count() > 0:
-                                    fallback.first.click(force=True, timeout=5000)
-                                    found_add = True
-                                    break
+                        # Validation failures keep the browser on the insert form.
+                        still_on_insert_form = (
+                            "manufedit.asp" in new_page.url.lower()
+                            and frame.locator("form[name='form1'] input[name='ID']").count() > 0
+                        )
+                        if still_on_insert_form:
+                            reason = submit_dialogs[-1] if submit_dialogs else "表單未離開新增頁"
+                            return f"ERROR: 受款人資料未成功送出: {reason}"
 
-                        new_page.wait_for_load_state("networkidle")
-                        time.sleep(1.0)
+                        success_fill = True
+                        break
 
-                        # 填寫受款人資料 (根據 PDF 畫面定位)
-                        success_fill = False
-                        for frame in new_page.frames:
-                            id_input = frame.locator("input[name='ID']")
-                            if id_input.count() > 0:
-                                id_input.first.fill(payee.get('payee_id', ''))
-                                frame.locator("input[name='MNAME']").first.fill(payee.get('payee_name', ''))
-
-                                # 銀行代碼是 readonly，強制用 JS 填入
-                                bank_code = payee.get('bank_code', '')
-                                bank_name_map = {"008": "華南商業銀行", "808": "玉山商業銀行", "700": "中華郵政"}
-                                bank_name = bank_name_map.get(bank_code, "")
-
-                                frame.locator("input[name='BANKCODE']").first.evaluate(f"node => node.value = '{bank_code}'")
-                                frame.locator("input[name='BANKNAME']").first.evaluate(f"node => node.value = '{bank_name}'")
-
-                                frame.locator("input[name='ACCNO']").first.fill(payee.get('account_number', ''))
-
-                                # 送出
-                                new_page.once("dialog", _safe_accept)
-                                frame.locator("input[name='Submit'][value='送出'], input[value='送出'], button:has-text('送出')").first.click(force=True)
-                                time.sleep(2.0)
-                                success_fill = True
-                                break
-
-                        if success_fill:
-                            new_page.close()
-                        else:
-                            return "ERROR: 無法在畫面上找到受款人填寫欄位 (可能未成功點選 '+' 按鈕)，請在開啟的視窗中手動操作。"
-                    else:
-                        return "ERROR: 無法在選單中找到 '受款人管理'，請在開啟的視窗中手動操作。"
+                    if not success_fill:
+                        return "ERROR: 無法在受款人新增頁找到 form1 / ID 欄位。"
+                    new_page.close()
 
                     # 回到原來的 tab, 再次點擊儲存
                     if save_btn.count() > 0:
