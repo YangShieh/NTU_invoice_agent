@@ -306,21 +306,6 @@ def update_invoice(invoice_index: int, data: InvoiceData):
     )
     return {"ok": True, "count": len(invoices)}
 
-@app.post("/api/open-browser")
-def open_browser_endpoint():
-    """Step A — open browser to NTU login page for the user to log in manually."""
-    from agent import open_browser_for_login
-    session = load_session()
-    case_id = ensure_case_id(session)
-    save_session(session)
-    try:
-        open_browser_for_login()
-        log_event(case_id, "browser.open", "completed")
-        return {"ok": True}
-    except Exception as e:
-        log_event(case_id, "browser.open", "failed", **error_details(e))
-        raise HTTPException(500, f"{e}（案件 ID: {case_id}）")
-
 @app.post("/api/run-agent")
 def run_agent_endpoint(manual: bool = False):
     """Step B — called after the user confirms they've logged in. Runs the agent loop."""

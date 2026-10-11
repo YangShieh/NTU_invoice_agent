@@ -1218,49 +1218,6 @@ _state = {
     "last_tool_outcome": None,
 }
 
-def open_browser_for_login() -> None:
-    pw = sync_playwright().start()
-    browser = pw.chromium.launch(headless=False)
-    context = browser.new_context(accept_downloads=True, ignore_https_errors=True)
-    page = context.new_page()
-    page.goto("https://ntuacc.cc.ntu.edu.tw/acc/")
-    _state.update({
-        "pw": pw,
-        "browser": browser,
-        "context": context,
-        "page": page,
-        "owner_thread_id": threading.get_ident(),
-        "close_requested": False,
-    })
-
-def continue_after_login(cfg: dict, payee: dict, invoices: list) -> str:
-    """Step B — called after the user confirms login is done in the browser window."""
-    owner_thread_id = _state.get("owner_thread_id")
-    if owner_thread_id is not None and owner_thread_id != threading.get_ident():
-        raise RuntimeError(
-            "登入瀏覽器屬於另一個執行緒，請關閉後改用自動登入重試。"
-        )
-    page = _state.get("page")
-    if page is None:
-        raise RuntimeError("No browser session open. Call open_browser_for_login() first.")
-
-    # ── 在 Agent 啟動前，強制插入自動登入流程 ──
-    # 這裡會讀取 cfg 中的帳號密碼，並執行你寫好的 auto_login
-    print("\n--- 開始自動登入 ---")
-    auto_login(page, cfg)
-    print("--- 自動登入結束 ---\n")
-    # ──────────────────────────────────────────
-
-    llm = OpenAI(base_url=cfg["agent_base_url"], api_key="not-needed")
-    case_id = "unassigned"
-    _state.pop("report_number", None)
-    _state.pop("print_url", None)
-    report_number = resolved_report_number(
-        run_agent_loop(page, llm, cfg, payee, invoices, case_id=case_id)
-    )
-    _save_audit_log(case_id, report_number, invoices)
-    return report_number
-
 def close_browser() -> None:
     owner_thread_id = _state.get("owner_thread_id")
     if owner_thread_id is not None and owner_thread_id != threading.get_ident():

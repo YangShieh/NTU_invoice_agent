@@ -23,6 +23,8 @@ print_page.html
 audit_*.json
 frontend/logs/
 backend/logs/
+# Supervisor stdout/stderr (written by win11_supervisor.ps1)
+/logs/
 
 # macOS
 .DS_Store
