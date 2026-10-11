@@ -319,8 +319,12 @@ def update_invoice(invoice_index: int, data: InvoiceData):
     return {"ok": True, "count": len(invoices)}
 
 @app.post("/api/run-agent")
-def run_agent_endpoint(manual: bool = False):
-    """Step B — called after the user confirms they've logged in. Runs the agent loop."""
+def run_agent_endpoint(manual: bool = False, delete_unfinished: bool = False):
+    """Run the agent for the confirmed round.
+
+    delete_unfinished=true is the person's approval to delete the unfinished
+    NTU reports recorded in session["pending_cleanup"] before filing again.
+    """
     session = load_session()
     case_id = ensure_case_id(session)
     if "payee" not in session or "invoices" not in session or not session["invoices"]:
@@ -330,6 +334,13 @@ def run_agent_endpoint(manual: bool = False):
     if session.get("step") not in allowed_steps:
         log_event(case_id, "agent.validation", "failed", reason="invoice_not_confirmed")
         raise HTTPException(400, f"Invoice not confirmed yet（案件 ID: {case_id}）")
+    approved_deletions = None
+    if delete_unfinished:
+        approved_deletions = session.get("pending_cleanup") or []
+        if not manual or not approved_deletions:
+            log_event(case_id, "agent.validation", "failed", reason="no_pending_cleanup")
+            raise HTTPException(400, f"沒有待刪除的未完成報帳單（案件 ID: {case_id}）")
+    session.pop("pending_cleanup", None)
 
     session["step"] = "agent_running"
     save_session(session)
@@ -347,6 +358,11 @@ def run_agent_endpoint(manual: bool = False):
         # Persist immediately: once NTU has created the report, every later
         # attempt (or a restarted server) must reuse it, never file another.
         if load_session().get("case_id") != case_id:
+            return
+        if report is None:
+            # The saved report was unfinished and has been deleted in NTU.
+            session.pop("ntu_report", None)
+            save_session(session)
             return
         session["ntu_report"] = report
         save_session(session)
@@ -372,6 +388,7 @@ def run_agent_endpoint(manual: bool = False):
                 "case_id": case_id,
                 "existing_report": session.get("ntu_report"),
                 "on_report_created": remember_report,
+                "approved_deletions": approved_deletions,
             }
             for key, value in optional_kwargs.items():
                 if accepts_any or key in run_parameters:
@@ -455,6 +472,10 @@ def run_agent_endpoint(manual: bool = False):
         session_was_cleared = current_session.get("case_id") != case_id
         if not session_was_cleared:
             session["step"] = "agent_failed"
+            pending = getattr(e, "pending_reports", None)
+            if pending:
+                # Shown to the person, who must approve the deletion.
+                session["pending_cleanup"] = pending
             save_session(session)
         log_event(
             case_id, "agent.run", "failed",
@@ -735,6 +756,12 @@ textarea{resize:vertical;min-height:50px}
     <div class="btn-row">
       <button class="btn btn-primary" id="btn-manual-retry" onclick="runAgent(true)">手動重試</button>
       <button class="btn btn-danger" onclick="clearAndGoHome()">清除資料並回主頁</button>
+    </div>
+    <div id="cleanup-actions" style="display:none;margin-top:10px">
+      <p style="font-size:12px;color:#991b1b" id="cleanup-text"></p>
+      <div class="btn-row">
+        <button class="btn btn-danger" id="btn-cleanup-retry" onclick="deleteUnfinishedAndRetry()">刪除未完成報帳單並重新報帳</button>
+      </div>
     </div>
   </div>
 </div>
@@ -1186,14 +1213,48 @@ function resetOcr() {
   setMsg('msg-upload', '', '');
 }
 
-async function runAgent(manual = false) {
+let pendingCleanup = [];
+
+function showCleanup(reports) {
+  pendingCleanup = reports || [];
+  const box = document.getElementById('cleanup-actions');
+  if (!pendingCleanup.length) {
+    box.style.display = 'none';
+    return;
+  }
+  const codes = pendingCleanup.map(r => r.code || r.asn).join('、');
+  document.getElementById('cleanup-text').textContent =
+    `NTU 報帳系統已有本輪未完成的報帳單：${codes}。可刪除後重新報帳；刪除後無法復原。`;
+  document.getElementById('btn-cleanup-retry').disabled = false;
+  box.style.display = 'block';
+}
+
+async function refreshCleanup() {
+  try {
+    const res = await fetch('/api/session');
+    if (res.ok) showCleanup((await res.json()).pending_cleanup);
+  } catch (err) {
+    console.error('Unable to read pending cleanup:', err);
+  }
+}
+
+function deleteUnfinishedAndRetry() {
+  if (!pendingCleanup.length) return;
+  const codes = pendingCleanup.map(r => r.code || r.asn).join('、');
+  if (!confirm(`將在 NTU 報帳系統永久刪除報帳單 ${codes}，並重新報帳。刪除後無法復原，確定繼續？`)) return;
+  return runAgent(true, true);
+}
+
+async function runAgent(manual = false, deleteUnfinished = false) {
   document.getElementById('btn-run-agent').disabled = true;
   document.getElementById('btn-manual-retry').disabled = true;
+  document.getElementById('btn-cleanup-retry').disabled = true;
   document.getElementById('agent-failure-actions').style.display = 'none';
   document.getElementById('msg-agent').innerHTML = manual
     ? '<span class="spinner"></span>手動重試中；若失敗仍可再次重試...'
     : '<span class="spinner"></span>Agent 執行中；失敗時最多自動嘗試 3 次...';
-  const res = await fetch('/api/run-agent' + (manual ? '?manual=true' : ''), {method:'POST'});
+  const query = manual ? ('?manual=true' + (deleteUnfinished ? '&delete_unfinished=true' : '')) : '';
+  const res = await fetch('/api/run-agent' + query, {method:'POST'});
   if (res.ok) {
     const data = await res.json();
     document.getElementById('report-number').textContent = data.report_number || '—';
@@ -1209,6 +1270,7 @@ async function runAgent(manual = false) {
     document.getElementById('btn-run-agent').disabled = false;
     document.getElementById('btn-manual-retry').disabled = false;
     document.getElementById('agent-failure-actions').style.display = 'block';
+    await refreshCleanup();
   }
 }
 
@@ -1280,6 +1342,7 @@ async function restoreSessionState() {
       setMsg('msg-agent', 'Agent 上次執行失敗，可手動重試或清除資料回主頁。', 'err');
       document.getElementById('agent-failure-actions').style.display = 'block';
       document.getElementById('btn-manual-retry').disabled = false;
+      showCleanup(session.pending_cleanup);
     }
     if (session.step === 'agent_done') {
       markDone(4);

@@ -577,6 +577,19 @@ class NonRetryableSubmissionError(RuntimeError):
     retryable = False
 
 
+class UnfinishedReportsFound(NonRetryableSubmissionError):
+    """Unfinished NTU reports for this claim must be deleted before filing
+    again. Deleting is irreversible, so it waits for a person to approve."""
+
+    def __init__(self, reports: list):
+        self.pending_reports = reports
+        codes = "、".join(r.get("code") or r["asn"] for r in reports)
+        super().__init__(
+            f"NTU 已有本輪未完成的報帳單 {codes}。"
+            "請確認後按「刪除未完成報帳單並重新報帳」，或在報帳系統手動處理。"
+        )
+
+
 def _fetch_ntu_html(page: Page, path: str) -> str:
     """GET an NTU page with the browser context's cookies. NTU serves Big5."""
     response = page.context.request.get(f"{NTU_APPLY_URL}/{path}", timeout=15000)
@@ -645,15 +658,32 @@ def remember_created_report(page: Page, asn: str, code: str = "") -> None:
             print(f"⚠️ Could not persist the created report: {e}")
 
 
-def find_existing_report(page: Page, payee: dict, invoices: list):
-    """Find a report on the newest list page with this payee and all invoices."""
+E_INVOICE_NUMBER = re.compile(r"[A-Z]{2}\d{8}")
+
+
+def _report_invoice_numbers(detail_html: str) -> set:
+    """Invoice numbers listed in a report's 單據清單."""
+    section = detail_html.split("發票號碼", 1)[-1].split("付 款 方 式", 1)[0]
+    return {n.upper() for n in re.findall(r"<tr>\s*<td>\s*([0-9A-Za-z]+)\s*</td>", section)}
+
+
+def scan_existing_reports(page: Page, payee: dict, invoices: list) -> dict:
+    """Classify reports on the newest list page that belong to this claim.
+
+    reuse     – a complete report with this payee and every invoice.
+    deletable – unfinished reports holding only this round's invoices, never
+                printed or vouchered; deleted only after a person approves.
+    blocked   – unfinished reports holding this round's invoices that are not
+                safe to delete through this application.
+    """
     payee_name = str(payee.get("payee_name", "")).strip()
-    numbers = [
+    ours = {
         str(inv.get("invoice_number", "")).strip().upper()
         for inv in invoices if str(inv.get("invoice_number", "")).strip()
-    ]
-    if not payee_name or not numbers:
-        return None
+    }
+    result = {"reuse": None, "deletable": [], "blocked": []}
+    if not payee_name or not ours:
+        return result
 
     listing = _fetch_ntu_html(page, "list.asp")
     rows = re.finditer(
@@ -661,22 +691,87 @@ def find_existing_report(page: Page, payee: dict, invoices: list):
     )
     for match in rows:
         asn, code, row = match.groups()
-        if payee_name not in row:
+        # Columns: 條碼 名稱 代碼 經費別 金額 報帳日 傳票號碼 付款資料 報帳ID 列印次數 受款人
+        cells = [re.sub(r"<[^>]+>", "", c).strip() for c in re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)]
+        row_payee = cells[10] if len(cells) > 10 else ""
+        if row_payee and row_payee != payee_name:
             continue
         detail = _fetch_ntu_html(page, f"appshow.asp?sn={asn}")
-        if all(number in detail.upper() for number in numbers):
-            return {"asn": asn, "code": code, "complete": report_is_complete(detail)}
-    return None
+        numbers = _report_invoice_numbers(detail)
+        overlap = numbers & ours
+        if not overlap:
+            continue
+        report = {"asn": asn, "code": code}
+        if report_is_complete(detail):
+            if row_payee == payee_name and ours <= numbers and result["reuse"] is None:
+                result["reuse"] = report
+            continue
+        voucher = cells[6] if len(cells) > 6 else ""
+        prints = cells[9] if len(cells) > 9 else ""
+        identifies_claim = (
+            row_payee == payee_name
+            or numbers == ours
+            or any(E_INVOICE_NUMBER.fullmatch(n) for n in overlap)
+        )
+        if numbers <= ours and not voucher and prints in ("", "0") and identifies_claim:
+            result["deletable"].append(report)
+        else:
+            result["blocked"].append(report)
+    return result
+
+
+def delete_unfinished_report(page: Page, report: dict, case_id: str) -> None:
+    """Delete one person-approved report through NTU's own list page."""
+    asn = report["asn"]
+    code = report.get("code") or asn
+    expected = f"{asn}：報帳條碼【{code}】" if report.get("code") else f"{asn}："
+    manual = f"無法刪除未完成的報帳單 {code}，請在報帳系統手動刪除後再重試。"
+
+    page.goto(f"{NTU_APPLY_URL}/list.asp", wait_until="domcontentloaded")
+    line = page.evaluate(
+        """(asn) => {
+            const row = [...document.querySelectorAll('tr[id^="line"]')]
+                .find(r => (r.getAttribute('title') || '').startsWith(asn + '：'));
+            return row ? Number(row.id.slice(4)) : 0;
+        }""",
+        asn,
+    )
+    if not line:
+        log_event(case_id, "agent.cleanup", "failed", reason="row_not_found")
+        raise NonRetryableSubmissionError(manual)
+
+    def on_dialog(dialog):
+        # Accept NTU's delete confirmation only when it names this report.
+        try:
+            if dialog.type == "confirm" and expected not in dialog.message:
+                dialog.dismiss()
+            else:
+                dialog.accept()
+        except Exception:
+            pass
+
+    page.on("dialog", on_dialog)
+    try:
+        page.evaluate("(n) => Changerow(n)", line)
+        with page.expect_navigation(timeout=15000):
+            page.evaluate("() => { setTimeout(() => del(), 0); }")
+        page.wait_for_load_state("domcontentloaded")
+    except Exception as exc:
+        print(f"⚠️ Delete navigation for {code} did not complete: {exc}")
+    finally:
+        page.remove_listener("dialog", on_dialog)
+
+    listing = _fetch_ntu_html(page, "list.asp")
+    if re.search(r"title\s*=\s*['\"]" + re.escape(asn) + "：", listing):
+        log_event(case_id, "agent.cleanup", "failed", reason="still_listed")
+        raise NonRetryableSubmissionError(manual)
+    print(f"🗑️ Deleted unfinished NTU report {code}")
+    log_event(case_id, "agent.cleanup", "completed", deleted_report=code)
 
 
 def resume_existing_report(page: Page, report: dict) -> str:
-    """Print a report that already exists in NTU instead of filing a new one."""
+    """Print a complete report that already exists in NTU."""
     asn = report["asn"]
-    if not report_is_complete(_fetch_ntu_html(page, f"appshow.asp?sn={asn}")):
-        raise NonRetryableSubmissionError(
-            f"NTU 報帳單 {report.get('code') or asn} 尚未完成（單據小計與付款小計不符或缺少受款人）。"
-            "為避免重複報帳，請先在報帳系統修改或刪除該報帳單後再重試。"
-        )
     page.goto(f"{NTU_APPLY_URL}/appshow.asp?sn={asn}", wait_until="domcontentloaded")
     remember_created_report(page, asn, report.get("code", ""))
     result = print_receipt(page)
@@ -1101,11 +1196,15 @@ _submission_lock = threading.Lock()
 def run_submission(
     cfg: dict, payee: dict, invoices: list, headless: bool = True,
     case_id: str = "unassigned", existing_report: dict = None,
-    on_report_created=None,
+    on_report_created=None, approved_deletions: list = None,
 ) -> str:
     """Submit one round. existing_report ({asn, code}) is a report an earlier
     attempt already created; it is printed instead of filing a new one.
-    on_report_created(report) is called as soon as NTU creates a report."""
+    on_report_created(report) is called as soon as NTU creates a report, and
+    with None once an unfinished saved report has been deleted.
+    approved_deletions lists the unfinished reports ({asn, code}) a person
+    approved for deletion; any other unfinished report raises
+    UnfinishedReportsFound instead of being deleted."""
     if not _submission_lock.acquire(blocking=False):
         raise RuntimeError("另一個 Agent 任務正在執行，請稍候再試。")
 
@@ -1145,17 +1244,40 @@ def run_submission(
         print("🌐 Opening NTU accounting system (background)...")
         auto_login(page, cfg)
 
-        report = existing_report if (existing_report or {}).get("asn") else None
-        if report:
-            log_event(case_id, "agent.resume", "started", source="session")
-        else:
-            report = find_existing_report(page, payee, invoices)
-            if report and not report["complete"]:
-                log_event(case_id, "agent.resume", "failed", reason="unfinished_duplicate")
+        report = None
+        stale_report = None
+        if (existing_report or {}).get("asn"):
+            detail = _fetch_ntu_html(page, f"appshow.asp?sn={existing_report['asn']}")
+            if report_is_complete(detail):
+                report = existing_report
+                log_event(case_id, "agent.resume", "started", source="session")
+            else:
+                stale_report = existing_report
+
+        if not report:
+            # A complete report is reused; unfinished ones are deleted (after a
+            # person approves) and the claim is filed anew.
+            scan = scan_existing_reports(page, payee, invoices)
+            if scan["blocked"]:
+                codes = "、".join(r["code"] for r in scan["blocked"])
+                log_event(case_id, "agent.cleanup", "failed", reason="unsafe_to_delete")
                 raise NonRetryableSubmissionError(
-                    f"NTU 已有相同受款人與發票的未完成報帳單 {report['code']}。"
-                    "為避免重複報帳，請先在報帳系統確認或刪除該報帳單後再重試。"
+                    f"NTU 已有含本輪發票的未完成報帳單 {codes}，但無法由本程式刪除"
+                    "（已列印、已有傳票號碼，或含其他發票）。請在報帳系統確認或刪除後再重試。"
                 )
+            to_delete = list(scan["deletable"])
+            if stale_report and all(r["asn"] != stale_report["asn"] for r in to_delete):
+                to_delete.append(stale_report)
+            approved = {r.get("asn") for r in approved_deletions or []}
+            if any(r["asn"] not in approved for r in to_delete):
+                log_event(case_id, "agent.cleanup", "started", reason="awaiting_approval",
+                          report_count=len(to_delete))
+                raise UnfinishedReportsFound(to_delete)
+            for unfinished in to_delete:
+                delete_unfinished_report(page, unfinished, case_id)
+            if stale_report and on_report_created:
+                on_report_created(None)
+            report = scan["reuse"]
             if report:
                 log_event(case_id, "agent.resume", "started", source="ntu_list")
 
