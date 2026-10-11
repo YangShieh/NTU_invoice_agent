@@ -125,41 +125,18 @@ def parse_amount(value) -> int:
     return int(round(float(str(value).replace(",", "").strip())))
 
 
-def allocate_claims(invoices: list, cap: int = PAYEE_CLAIM_CAP) -> list:
-    """Claim invoices in order until the payee cap is reached.
-
-    NTU only enables 完成 when the invoice subtotal equals the payment
-    subtotal, so the claimed invoice amounts must add up to the paid amount.
-    The invoice that crosses the cap is claimed partially; later ones are
-    left out of the report.
-    """
-    remaining = cap
-    claims = []
+def claims_summary(invoices: list) -> dict:
+    """Every invoice is filed at its full amount; only the payment to the
+    payee (and so the printed 黏存單) is capped per round."""
+    invoice_total = 0
     for invoice in invoices:
         try:
-            amount = max(parse_amount(invoice.get("total_amount", 0)), 0)
+            invoice_total += max(parse_amount(invoice.get("total_amount", 0)), 0)
         except ValueError:
-            amount = 0
-        claimed = min(amount, remaining)
-        remaining -= claimed
-        claims.append({"amount": amount, "claimed": claimed})
-    return claims
-
-
-def claimed_invoices(invoices: list) -> list:
-    """The invoices actually submitted to NTU, with their claimed amounts."""
-    return [
-        dict(invoice, total_amount=str(claim["claimed"]))
-        for invoice, claim in zip(invoices, allocate_claims(invoices))
-        if claim["claimed"] > 0
-    ]
-
-
-def claims_summary(invoices: list) -> dict:
-    claims = allocate_claims(invoices)
+            pass
     return {
-        "claims": claims,
-        "claim_total": sum(claim["claimed"] for claim in claims),
+        "invoice_total": invoice_total,
+        "claim_total": min(invoice_total, PAYEE_CLAIM_CAP),
         "claim_cap": PAYEE_CLAIM_CAP,
     }
 
@@ -357,11 +334,6 @@ def run_agent_endpoint(manual: bool = False):
         log_event(case_id, "agent.validation", "failed", reason="invoice_not_confirmed")
         raise HTTPException(400, f"Invoice not confirmed yet（案件 ID: {case_id}）")
 
-    submitted_invoices = claimed_invoices(session["invoices"])
-    if not submitted_invoices:
-        log_event(case_id, "agent.validation", "failed", reason="no_claimable_amount")
-        raise HTTPException(400, f"沒有可申請的發票金額（案件 ID: {case_id}）")
-
     session["step"] = "agent_running"
     save_session(session)
 
@@ -370,8 +342,8 @@ def run_agent_endpoint(manual: bool = False):
     started = time.monotonic()
     max_attempts = 1 if manual else 3
     log_event(
-        case_id, "agent.run", "started", invoice_count=len(submitted_invoices),
-        claim_total=sum(parse_amount(inv["total_amount"]) for inv in submitted_invoices),
+        case_id, "agent.run", "started", invoice_count=len(session["invoices"]),
+        claim_total=claims_summary(session["invoices"])["claim_total"],
         max_attempts=max_attempts, manual_retry=manual,
     )
     def remember_report(report: dict) -> None:
@@ -411,7 +383,7 @@ def run_agent_endpoint(manual: bool = False):
             report_number = run_submission(
                 cfg,
                 session["payee"],
-                submitted_invoices,
+                session["invoices"],
                 **run_kwargs,
             )
             report_number = str(
@@ -782,7 +754,7 @@ textarea{resize:vertical;min-height:50px}
 
 <script>
 let currentInvoices = [];
-let currentClaims = {claims: [], claim_total: 0, claim_cap: 2000};
+let currentClaims = {invoice_total: 0, claim_total: 0, claim_cap: 2000};
 let editingInvoiceIndex = null;
 let agentStarted = false;
 const unlock = id => document.getElementById(id).classList.remove('locked');
@@ -1025,15 +997,6 @@ function renderInvoiceList() {
     const detail = document.createElement('span');
     detail.textContent = `${invoice.date || '無日期'}｜NT$ ${invoice.total_amount || '0'}｜${invoice.expense_purpose || '無摘要'}`;
     main.append(title, detail);
-    const claim = (currentClaims.claims || [])[index];
-    if (claim && claim.claimed < claim.amount) {
-      const capped = document.createElement('span');
-      capped.style.cssText = 'display:block;color:#92400e';
-      capped.textContent = claim.claimed > 0
-        ? `超過每人 NT$ ${currentClaims.claim_cap} 上限，本筆申請 NT$ ${claim.claimed}`
-        : `已達每人 NT$ ${currentClaims.claim_cap} 上限，本筆不列入報帳`;
-      main.appendChild(capped);
-    }
     const edit = document.createElement('button');
     edit.className = 'btn btn-ghost';
     edit.textContent = '編輯';
@@ -1050,7 +1013,9 @@ function renderInvoiceList() {
   }
   document.getElementById('inv-count').textContent = currentInvoices.length;
   document.getElementById('claim-summary').textContent = currentInvoices.length
-    ? `申請總額 NT$ ${currentClaims.claim_total}（每位受款人上限 NT$ ${currentClaims.claim_cap}）`
+    ? (currentClaims.invoice_total > currentClaims.claim_cap
+        ? `發票總額 NT$ ${currentClaims.invoice_total}，超過每位受款人上限；黏存單受款金額為 NT$ ${currentClaims.claim_total}`
+        : `發票總額 NT$ ${currentClaims.invoice_total}，受款金額 NT$ ${currentClaims.claim_total}（每位受款人上限 NT$ ${currentClaims.claim_cap}）`)
     : '';
 }
 

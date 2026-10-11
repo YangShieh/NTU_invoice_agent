@@ -566,6 +566,7 @@ def add_payee(page: Page, payee_id: str, note: str, amount: str, payee: dict = N
 # soon as it appears and handed to session_ui through on_report_created.
 
 NTU_APPLY_URL = "https://ntuacc.cc.ntu.edu.tw/acc/apply"
+PAYEE_CLAIM_CAP = 2000   # NT$ paid per payee per round
 REPORT_CREATING_TOOLS = {
     "open_plan_expense_page", "submit_project_code", "select_project_row",
     "add_invoice", "add_payee",
@@ -610,9 +611,20 @@ def lookup_report_code(page: Page, asn: str) -> str:
 
 
 def report_is_complete(detail_html: str) -> bool:
-    """A report is complete when it has a payment row and NTU shows no
-    '單據清單小計 ... 不等於 付款方式小計' warning (完成 is disabled until they match)."""
-    return "匯代墊人" in detail_html and "不等於" not in detail_html
+    """A report is complete when it has a payment row and its payment subtotal
+    is the full invoice subtotal, or exactly the per-payee cap when the
+    invoices total more (NTU then shows a harmless '不等於' warning)."""
+    if "匯代墊人" not in detail_html:
+        return False
+    text = re.sub(r"<[^>]+>", "", detail_html)
+    mismatch = re.search(
+        r"單據清單小計\(\s*\$?\s*([\d,]+)\s*\)\s*不等於\s*付款方式小計\(\s*\$?\s*([\d,]+)\s*\)",
+        text,
+    )
+    if not mismatch:
+        return "不等於" not in text
+    invoice_total, paid = (int(v.replace(",", "")) for v in mismatch.groups())
+    return paid == PAYEE_CLAIM_CAP and invoice_total > PAYEE_CLAIM_CAP
 
 
 def remember_created_report(page: Page, asn: str, code: str = "") -> None:
@@ -746,9 +758,6 @@ def print_receipt(page: Page) -> str:
         return f"ERROR in print_receipt: {e}"
 
 
-PAYEE_CLAIM_CAP = 2000
-
-
 def _invoice_key(value) -> str:
     return str(value or "").strip().upper()
 
@@ -785,9 +794,7 @@ def bind_confirmed_args(name: str, args: dict, payee: dict):
         return f"ERROR: 發票 {number} 不在本輪已確認的發票中。"
 
     if name == "add_payee":
-        total = sum(_invoice_amount(invoice) for invoice in invoices)
-        if total > PAYEE_CLAIM_CAP:
-            return f"ERROR: 申請總額 {total} 超過每位受款人上限 {PAYEE_CLAIM_CAP}。"
+        total = min(sum(_invoice_amount(invoice) for invoice in invoices), PAYEE_CLAIM_CAP)
         return dict(args, payee_id=str((payee or {}).get("payee_id", "")).strip(), amount=str(total))
 
     return args
