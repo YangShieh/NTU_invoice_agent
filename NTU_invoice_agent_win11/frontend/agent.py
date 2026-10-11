@@ -546,8 +546,11 @@ def add_payee(page: Page, payee_id: str, note: str, amount: str, payee: dict = N
                     with page.expect_navigation(timeout=10000):
                         complete_btn.first.click(timeout=5000)
                     page.wait_for_load_state("networkidle")
+                    remember_created_report(page, find_report_asn(page))
                     return "OK - Payee added, saved, and clicked '完成'."
                 except Exception as e:
+                    # The report may exist even when the navigation wait fails.
+                    remember_created_report(page, find_report_asn(page))
                     return f"ERROR: 點擊了 '完成' 但導航失敗: {str(e)}"
             else:
                 return "ERROR: 受款人已儲存，但找不到 '完成' 按鈕。"
@@ -555,6 +558,109 @@ def add_payee(page: Page, payee_id: str, note: str, amount: str, payee: dict = N
         return "ERROR: 在畫面上找不到受款人代號 (mid) 的輸入框。"
     except Exception as e:
         return f"ERROR in add_payee: {str(e)}"
+
+
+# ── Report identity (prevents duplicate NTU reports across retries) ─────────
+# Once '完成' is clicked the report exists in NTU. Every later retry must reuse
+# it instead of filing a new one, so its internal serial (asn) is captured as
+# soon as it appears and handed to session_ui through on_report_created.
+
+NTU_APPLY_URL = "https://ntuacc.cc.ntu.edu.tw/acc/apply"
+REPORT_CREATING_TOOLS = {
+    "open_plan_expense_page", "submit_project_code", "select_project_row",
+    "add_invoice", "add_payee",
+}
+
+
+class NonRetryableSubmissionError(RuntimeError):
+    """A failure that another automatic attempt cannot fix."""
+    retryable = False
+
+
+def _fetch_ntu_html(page: Page, path: str) -> str:
+    """GET an NTU page with the browser context's cookies. NTU serves Big5."""
+    response = page.context.request.get(f"{NTU_APPLY_URL}/{path}", timeout=15000)
+    if not response.ok:
+        raise RuntimeError(f"NTU {path.split('?')[0]} returned HTTP {response.status}")
+    return response.body().decode("big5", errors="replace")
+
+
+def find_report_asn(page: Page) -> str:
+    """Return the internal serial of the report shown on the current page."""
+    for frame in page.frames:
+        try:
+            box = frame.locator(
+                "form[action*='printmain'] input[name='asn'], "
+                "form:has(input[value='列印黏存單']) input[name='asn']"
+            )
+            if box.count() > 0:
+                asn = (box.first.get_attribute("value") or "").strip()
+                if asn.isdigit():
+                    return asn
+        except Exception:
+            continue
+    return ""
+
+
+def lookup_report_code(page: Page, asn: str) -> str:
+    """Return the 報帳條碼 (e.g. 115A408L146) for an internal serial."""
+    html = _fetch_ntu_html(page, f"appshow.asp?sn={asn}")
+    match = re.search(r"APPCODE=([0-9A-Za-z]+)", html)
+    return match.group(1) if match else ""
+
+
+def remember_created_report(page: Page, asn: str, code: str = "") -> None:
+    if not asn or _state.get("report_asn") == asn:
+        return
+    _state["report_asn"] = asn
+    if not code:
+        try:
+            code = lookup_report_code(page, asn)
+        except Exception as e:
+            print(f"⚠️ Could not read the report barcode: {e}")
+    _state["report_code"] = code
+    print(f"🧾 NTU report created: {code or 'asn=' + asn}")
+    callback = _state.get("on_report_created")
+    if callback:
+        try:
+            callback({"asn": asn, "code": code})
+        except Exception as e:
+            print(f"⚠️ Could not persist the created report: {e}")
+
+
+def find_existing_report(page: Page, payee: dict, invoices: list):
+    """Find a report on the newest list page with this payee and all invoices."""
+    payee_name = str(payee.get("payee_name", "")).strip()
+    numbers = [
+        str(inv.get("invoice_number", "")).strip().upper()
+        for inv in invoices if str(inv.get("invoice_number", "")).strip()
+    ]
+    if not payee_name or not numbers:
+        return None
+
+    listing = _fetch_ntu_html(page, "list.asp")
+    rows = re.finditer(
+        r"title\s*=\s*['\"](\d+)：報帳條碼【([^】]+)】(.*?)</tr>", listing, re.S
+    )
+    for match in rows:
+        asn, code, row = match.groups()
+        if payee_name not in row:
+            continue
+        detail = _fetch_ntu_html(page, f"appshow.asp?sn={asn}").upper()
+        if all(number in detail for number in numbers):
+            return {"asn": asn, "code": code, "has_payment": "匯代墊人" in detail}
+    return None
+
+
+def resume_existing_report(page: Page, report: dict) -> str:
+    """Print a report that already exists in NTU instead of filing a new one."""
+    asn = report["asn"]
+    page.goto(f"{NTU_APPLY_URL}/appshow.asp?sn={asn}", wait_until="domcontentloaded")
+    remember_created_report(page, asn, report.get("code", ""))
+    result = print_receipt(page)
+    if result.startswith("ERROR"):
+        raise RuntimeError(result)
+    return resolved_report_number()
 
 
 def print_receipt(page: Page) -> str:
@@ -565,6 +671,8 @@ def print_receipt(page: Page) -> str:
             if asn_input.count() > 0:
                 asn = asn_input.first.get_attribute("value")
                 if asn:
+                    remember_created_report(page, asn)
+                    report_number = _state.get("report_code") or asn
                     print_url = f"https://ntuacc.cc.ntu.edu.tw/acc/apply/printatt.asp?asn={asn}"
                     _state["print_url"] = print_url
                     print(f"🖨️ Downloading print page: {print_url}")
@@ -579,7 +687,7 @@ def print_receipt(page: Page) -> str:
                             page.evaluate(f"window.open('{print_url}')")
                         download = download_info.value
                         download.save_as(pdf_path)
-                        _state["report_number"] = asn
+                        _state["report_number"] = report_number
                         print(f"🖨️ PDF downloaded to {pdf_path}")
 
                         # --- 新增：下載後自動開啟 PDF ---
@@ -604,7 +712,7 @@ def print_receipt(page: Page) -> str:
                                 print_btn.first.click(force=True)
                             download = download_info.value
                             download.save_as(pdf_path)
-                            _state["report_number"] = asn
+                            _state["report_number"] = report_number
                             print(f"🖨️ PDF downloaded (via button) to {pdf_path}")
 
                             # --- 新增：Fallback 也要自動開啟 PDF ---
@@ -628,6 +736,12 @@ def print_receipt(page: Page) -> str:
 
 
 def dispatch_tool(page: Page, name: str, args: dict, payee: dict = None) -> str:
+    if name in REPORT_CREATING_TOOLS and _state.get("report_asn"):
+        report = _state.get("report_code") or _state["report_asn"]
+        return (
+            f"ERROR: 報帳單 {report} 已建立，不可重新報帳；"
+            "請呼叫 print_receipt 或 report_done。"
+        )
     match name:
         case "get_page_state":         return get_page_state(page)
         case "open_plan_expense_page": return open_plan_expense_page(page)
@@ -915,8 +1029,12 @@ _submission_lock = threading.Lock()
 # 修改原有的 run_submission 函數
 def run_submission(
     cfg: dict, payee: dict, invoices: list, headless: bool = True,
-    case_id: str = "unassigned",
+    case_id: str = "unassigned", existing_report: dict = None,
+    on_report_created=None,
 ) -> str:
+    """Submit one round. existing_report ({asn, code}) is a report an earlier
+    attempt already created; it is printed instead of filing a new one.
+    on_report_created(report) is called as soon as NTU creates a report."""
     if not _submission_lock.acquire(blocking=False):
         raise RuntimeError("另一個 Agent 任務正在執行，請稍候再試。")
 
@@ -931,6 +1049,9 @@ def run_submission(
         _state.pop("print_url", None)
         _state.pop("last_tool", None)
         _state.pop("last_tool_outcome", None)
+        _state["report_asn"] = None
+        _state["report_code"] = None
+        _state["on_report_created"] = on_report_created
         _state["close_requested"] = False
 
         # Playwright's synchronous API is thread-affine. Create, use, and close
@@ -951,9 +1072,27 @@ def run_submission(
         print("🌐 Opening NTU accounting system (background)...")
         auto_login(page, cfg)
 
-        report_number = resolved_report_number(
-            run_agent_loop(page, llm, cfg, payee, invoices, case_id=case_id)
-        )
+        report = existing_report if (existing_report or {}).get("asn") else None
+        if report:
+            log_event(case_id, "agent.resume", "started", source="session")
+        else:
+            report = find_existing_report(page, payee, invoices)
+            if report and not report["has_payment"]:
+                log_event(case_id, "agent.resume", "failed", reason="unfinished_duplicate")
+                raise NonRetryableSubmissionError(
+                    f"NTU 已有相同受款人與發票的未完成報帳單 {report['code']}。"
+                    "為避免重複報帳，請先在報帳系統確認或刪除該報帳單後再重試。"
+                )
+            if report:
+                log_event(case_id, "agent.resume", "started", source="ntu_list")
+
+        if report:
+            print(f"♻️ Reusing existing NTU report {report.get('code') or report['asn']}")
+            report_number = resume_existing_report(page, report)
+        else:
+            report_number = resolved_report_number(
+                run_agent_loop(page, llm, cfg, payee, invoices, case_id=case_id)
+            )
         _save_audit_log(case_id, report_number, invoices)
 
         if report_number:
@@ -974,6 +1113,7 @@ def run_submission(
                 except Exception as cleanup_error:
                     print(f"⚠️ Browser cleanup warning: {cleanup_error}")
 
+        _state["on_report_created"] = None
         if _state.get("owner_thread_id") == owner_thread_id:
             _state.update({
                 "pw": None,
@@ -993,6 +1133,9 @@ _state = {
     "owner_thread_id": None,
     "close_requested": False,
     "report_number": None,
+    "report_asn": None,
+    "report_code": None,
+    "on_report_created": None,
     "print_url": None,
     "last_tool": None,
     "last_tool_outcome": None,

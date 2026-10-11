@@ -300,24 +300,39 @@ def run_agent_endpoint(manual: bool = False):
         case_id, "agent.run", "started", invoice_count=len(session["invoices"]),
         max_attempts=max_attempts, manual_retry=manual,
     )
+    def remember_report(report: dict) -> None:
+        # Persist immediately: once NTU has created the report, every later
+        # attempt (or a restarted server) must reuse it, never file another.
+        if load_session().get("case_id") != case_id:
+            return
+        session["ntu_report"] = report
+        save_session(session)
+        log_event(case_id, "agent.report_created", "completed", has_code=bool(report.get("code")))
+
     report_number = ""
     last_error = None
     completed_attempt = 0
     for attempt in range(1, max_attempts + 1):
+        if load_session().get("case_id") != case_id:
+            last_error = RuntimeError("Session was cleared while the Agent was running")
+            break
         attempt_started = time.monotonic()
         log_event(case_id, "agent.attempt", "started", attempt=attempt, max_attempts=max_attempts)
         try:
             run_parameters = inspect.signature(run_submission).parameters
-            supports_case_id = (
-                "case_id" in run_parameters
-                or any(
-                    parameter.kind == inspect.Parameter.VAR_KEYWORD
-                    for parameter in run_parameters.values()
-                )
+            accepts_any = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in run_parameters.values()
             )
             run_kwargs = {"headless": False}
-            if supports_case_id:
-                run_kwargs["case_id"] = case_id
+            optional_kwargs = {
+                "case_id": case_id,
+                "existing_report": session.get("ntu_report"),
+                "on_report_created": remember_report,
+            }
+            for key, value in optional_kwargs.items():
+                if accepts_any or key in run_parameters:
+                    run_kwargs[key] = value
 
             report_number = run_submission(
                 cfg,
@@ -367,6 +382,8 @@ def run_agent_endpoint(manual: bool = False):
                 close_browser()
             except Exception:
                 pass
+            if getattr(exc, "retryable", True) is False:
+                break
             if attempt < max_attempts:
                 time.sleep(min(2 ** (attempt - 1), 4))
 
