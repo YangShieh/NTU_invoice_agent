@@ -746,6 +746,53 @@ def print_receipt(page: Page) -> str:
         return f"ERROR in print_receipt: {e}"
 
 
+PAYEE_CLAIM_CAP = 2000
+
+
+def _invoice_key(value) -> str:
+    return str(value or "").strip().upper()
+
+
+def _invoice_amount(invoice: dict) -> int:
+    return int(round(float(str(invoice.get("total_amount", 0)).replace(",", ""))))
+
+
+def bind_confirmed_args(name: str, args: dict, payee: dict):
+    """Replace model-supplied values with the user-confirmed round data.
+
+    The model only chooses which step to run; numbers, purposes, amounts and
+    the payee ID always come from what the user reviewed. Returns the bound
+    args, or an 'ERROR…'/'OK…' string to report back without acting.
+    """
+    invoices = _state.get("round_invoices")
+    if not invoices:
+        return args
+
+    if name == "add_invoice":
+        number = _invoice_key(args.get("invoice_number"))
+        saved = _state.setdefault("saved_invoices", set())
+        if number in saved:
+            return f"OK - Invoice {number} was already saved; continue with the next step."
+        for invoice in invoices:
+            if _invoice_key(invoice.get("invoice_number")) == number:
+                others = {_invoice_key(i.get("invoice_number")) for i in invoices} - {number}
+                return {
+                    "invoice_number": str(invoice["invoice_number"]).strip(),
+                    "purpose": invoice.get("expense_purpose", ""),
+                    "amount": str(_invoice_amount(invoice)),
+                    "is_last_invoice": others <= saved,
+                }
+        return f"ERROR: 發票 {number} 不在本輪已確認的發票中。"
+
+    if name == "add_payee":
+        total = sum(_invoice_amount(invoice) for invoice in invoices)
+        if total > PAYEE_CLAIM_CAP:
+            return f"ERROR: 申請總額 {total} 超過每位受款人上限 {PAYEE_CLAIM_CAP}。"
+        return dict(args, payee_id=str((payee or {}).get("payee_id", "")).strip(), amount=str(total))
+
+    return args
+
+
 def dispatch_tool(page: Page, name: str, args: dict, payee: dict = None) -> str:
     if name in REPORT_CREATING_TOOLS and _state.get("report_asn"):
         report = _state.get("report_code") or _state["report_asn"]
@@ -753,12 +800,19 @@ def dispatch_tool(page: Page, name: str, args: dict, payee: dict = None) -> str:
             f"ERROR: 報帳單 {report} 已建立，不可重新報帳；"
             "請呼叫 print_receipt 或 report_done。"
         )
+    args = bind_confirmed_args(name, args, payee)
+    if isinstance(args, str):
+        return args
+    if name == "add_invoice":
+        result = add_invoice(page, args["invoice_number"], args["purpose"], args["amount"], args["is_last_invoice"])
+        if result.startswith("OK"):
+            _state.setdefault("saved_invoices", set()).add(_invoice_key(args["invoice_number"]))
+        return result
     match name:
         case "get_page_state":         return get_page_state(page)
         case "open_plan_expense_page": return open_plan_expense_page(page)
         case "submit_project_code":    return submit_project_code(page, args.get("project_code", ""))
         case "select_project_row":     return select_project_row(page, args.get("project_code", ""))
-        case "add_invoice":            return add_invoice(page, args.get("invoice_number", ""), args.get("purpose", ""), args.get("amount", ""), args.get("is_last_invoice", True))
         case "add_payee":              return add_payee(page, args.get("payee_id", ""), args.get("note", ""), args.get("amount", ""), payee)
         case "print_receipt":          return print_receipt(page)
         case _:                        return "__TERMINAL__"
@@ -1063,6 +1117,8 @@ def run_submission(
         _state["report_asn"] = None
         _state["report_code"] = None
         _state["on_report_created"] = on_report_created
+        _state["round_invoices"] = list(invoices)
+        _state["saved_invoices"] = set()
         _state["close_requested"] = False
 
         # Playwright's synchronous API is thread-affine. Create, use, and close
@@ -1125,6 +1181,7 @@ def run_submission(
                     print(f"⚠️ Browser cleanup warning: {cleanup_error}")
 
         _state["on_report_created"] = None
+        _state["round_invoices"] = None
         if _state.get("owner_thread_id") == owner_thread_id:
             _state.update({
                 "pw": None,
@@ -1147,6 +1204,8 @@ _state = {
     "report_asn": None,
     "report_code": None,
     "on_report_created": None,
+    "round_invoices": None,
+    "saved_invoices": set(),
     "print_url": None,
     "last_tool": None,
     "last_tool_outcome": None,

@@ -118,6 +118,71 @@ class InvoiceData(BaseModel):
     expense_purpose: str
 
 
+PAYEE_CLAIM_CAP = 2000   # NT$ per payee per round
+
+
+def parse_amount(value) -> int:
+    return int(round(float(str(value).replace(",", "").strip())))
+
+
+def allocate_claims(invoices: list, cap: int = PAYEE_CLAIM_CAP) -> list:
+    """Claim invoices in order until the payee cap is reached.
+
+    NTU only enables 完成 when the invoice subtotal equals the payment
+    subtotal, so the claimed invoice amounts must add up to the paid amount.
+    The invoice that crosses the cap is claimed partially; later ones are
+    left out of the report.
+    """
+    remaining = cap
+    claims = []
+    for invoice in invoices:
+        try:
+            amount = max(parse_amount(invoice.get("total_amount", 0)), 0)
+        except ValueError:
+            amount = 0
+        claimed = min(amount, remaining)
+        remaining -= claimed
+        claims.append({"amount": amount, "claimed": claimed})
+    return claims
+
+
+def claimed_invoices(invoices: list) -> list:
+    """The invoices actually submitted to NTU, with their claimed amounts."""
+    return [
+        dict(invoice, total_amount=str(claim["claimed"]))
+        for invoice, claim in zip(invoices, allocate_claims(invoices))
+        if claim["claimed"] > 0
+    ]
+
+
+def claims_summary(invoices: list) -> dict:
+    claims = allocate_claims(invoices)
+    return {
+        "claims": claims,
+        "claim_total": sum(claim["claimed"] for claim in claims),
+        "claim_cap": PAYEE_CLAIM_CAP,
+    }
+
+
+def validate_invoice(data: dict, invoices: list, case_id: str, index: int = None) -> None:
+    """Reject amounts NTU cannot accept and invoice numbers reused in this round."""
+    try:
+        amount = parse_amount(data["total_amount"])
+    except ValueError:
+        raise HTTPException(400, f"金額必須為數字（案件 ID: {case_id}）")
+    if amount <= 0:
+        raise HTTPException(400, f"金額必須大於 0（案件 ID: {case_id}）")
+    data["total_amount"] = str(amount)
+
+    number = data["invoice_number"].strip().upper()
+    for other_index, other in enumerate(invoices):
+        if other_index != index and str(other.get("invoice_number", "")).strip().upper() == number:
+            raise HTTPException(
+                400,
+                f"發票號碼與第 {other_index + 1} 筆重複，請修改後再確認（案件 ID: {case_id}）",
+            )
+
+
 def ensure_editable_before_agent(session: dict, case_id: str) -> None:
     """Invoice/payee data becomes immutable once the Agent has started."""
     if session.get("step") in {"agent_running", "agent_failed", "agent_done"}:
@@ -218,6 +283,7 @@ def confirm_invoice(data: InvoiceData):
     ensure_editable_before_agent(session, case_id)
     original = session.get("invoice", {})
     submitted = data.model_dump()
+    validate_invoice(submitted, session.get("invoices", []), case_id)
     changed_fields = [
         key for key in ("invoice_number", "date", "total_amount", "items", "expense_purpose")
         if original.get(key) != submitted.get(key)
@@ -237,7 +303,8 @@ def confirm_invoice(data: InvoiceData):
 @app.get("/api/invoices")
 def list_invoices():
     session = load_session()
-    return {"invoices": session.get("invoices", [])}
+    invoices = session.get("invoices", [])
+    return {"invoices": invoices, **claims_summary(invoices)}
 
 @app.put("/api/invoices/{invoice_index}")
 def update_invoice(invoice_index: int, data: InvoiceData):
@@ -249,6 +316,7 @@ def update_invoice(invoice_index: int, data: InvoiceData):
         raise HTTPException(404, f"找不到指定發票（案件 ID: {case_id}）")
     old = invoices[invoice_index]
     updated = data.model_dump()
+    validate_invoice(updated, invoices, case_id, index=invoice_index)
     changed_fields = [key for key in updated if old.get(key) != updated.get(key)]
     invoices[invoice_index] = updated
     session["invoices"] = invoices
@@ -289,6 +357,11 @@ def run_agent_endpoint(manual: bool = False):
         log_event(case_id, "agent.validation", "failed", reason="invoice_not_confirmed")
         raise HTTPException(400, f"Invoice not confirmed yet（案件 ID: {case_id}）")
 
+    submitted_invoices = claimed_invoices(session["invoices"])
+    if not submitted_invoices:
+        log_event(case_id, "agent.validation", "failed", reason="no_claimable_amount")
+        raise HTTPException(400, f"沒有可申請的發票金額（案件 ID: {case_id}）")
+
     session["step"] = "agent_running"
     save_session(session)
 
@@ -297,7 +370,8 @@ def run_agent_endpoint(manual: bool = False):
     started = time.monotonic()
     max_attempts = 1 if manual else 3
     log_event(
-        case_id, "agent.run", "started", invoice_count=len(session["invoices"]),
+        case_id, "agent.run", "started", invoice_count=len(submitted_invoices),
+        claim_total=sum(parse_amount(inv["total_amount"]) for inv in submitted_invoices),
         max_attempts=max_attempts, manual_retry=manual,
     )
     def remember_report(report: dict) -> None:
@@ -337,7 +411,7 @@ def run_agent_endpoint(manual: bool = False):
             report_number = run_submission(
                 cfg,
                 session["payee"],
-                session["invoices"],
+                submitted_invoices,
                 **run_kwargs,
             )
             report_number = str(
@@ -468,6 +542,7 @@ def get_session():
             "payee_name": s["payee"].get("payee_name"),
             "payee_id_hint": s["payee"].get("payee_id", "")[:3] + "******",
         }
+    safe.update(claims_summary(s.get("invoices", [])))
     return safe
 
 # ── Single-page UI ────────────────────────────────────────────────────────────
@@ -664,6 +739,7 @@ textarea{resize:vertical;min-height:50px}
     <label>本輪已確認發票（Agent 執行前可編輯）</label>
     <div class="invoice-list" id="confirmed-invoice-list"></div>
     <p style="font-size:13px; margin-bottom:10px;">目前已確認 <strong id="inv-count">0</strong> 筆發票。請先完成所有修改，再啟動 Agent。</p>
+    <p style="font-size:13px; margin-bottom:10px;" id="claim-summary"></p>
     <div class="btn-row">
       <button class="btn btn-ghost" onclick="addAnotherInvoice()">新增另一筆發票</button>
       <button class="btn btn-ghost" onclick="backToPayee()">修改個人資料</button>
@@ -706,6 +782,7 @@ textarea{resize:vertical;min-height:50px}
 
 <script>
 let currentInvoices = [];
+let currentClaims = {claims: [], claim_total: 0, claim_cap: 2000};
 let editingInvoiceIndex = null;
 let agentStarted = false;
 const unlock = id => document.getElementById(id).classList.remove('locked');
@@ -931,6 +1008,7 @@ async function loadInvoices() {
   if (!res.ok) return;
   const data = await res.json();
   currentInvoices = data.invoices || [];
+  currentClaims = data;
   renderInvoiceList();
 }
 
@@ -947,6 +1025,15 @@ function renderInvoiceList() {
     const detail = document.createElement('span');
     detail.textContent = `${invoice.date || '無日期'}｜NT$ ${invoice.total_amount || '0'}｜${invoice.expense_purpose || '無摘要'}`;
     main.append(title, detail);
+    const claim = (currentClaims.claims || [])[index];
+    if (claim && claim.claimed < claim.amount) {
+      const capped = document.createElement('span');
+      capped.style.cssText = 'display:block;color:#92400e';
+      capped.textContent = claim.claimed > 0
+        ? `超過每人 NT$ ${currentClaims.claim_cap} 上限，本筆申請 NT$ ${claim.claimed}`
+        : `已達每人 NT$ ${currentClaims.claim_cap} 上限，本筆不列入報帳`;
+      main.appendChild(capped);
+    }
     const edit = document.createElement('button');
     edit.className = 'btn btn-ghost';
     edit.textContent = '編輯';
@@ -962,6 +1049,9 @@ function renderInvoiceList() {
     list.appendChild(empty);
   }
   document.getElementById('inv-count').textContent = currentInvoices.length;
+  document.getElementById('claim-summary').textContent = currentInvoices.length
+    ? `申請總額 NT$ ${currentClaims.claim_total}（每位受款人上限 NT$ ${currentClaims.claim_cap}）`
+    : '';
 }
 
 function editInvoice(index) {
@@ -1149,6 +1239,7 @@ async function restoreSessionState() {
       );
     }
     currentInvoices = session.invoices || [];
+    currentClaims = session;
     agentStarted = ['agent_running', 'agent_failed', 'agent_done'].includes(session.step);
     renderInvoiceList();
     if (currentInvoices.length) {
