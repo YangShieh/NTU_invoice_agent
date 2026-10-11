@@ -609,6 +609,12 @@ def lookup_report_code(page: Page, asn: str) -> str:
     return match.group(1) if match else ""
 
 
+def report_is_complete(detail_html: str) -> bool:
+    """A report is complete when it has a payment row and NTU shows no
+    '單據清單小計 ... 不等於 付款方式小計' warning (完成 is disabled until they match)."""
+    return "匯代墊人" in detail_html and "不等於" not in detail_html
+
+
 def remember_created_report(page: Page, asn: str, code: str = "") -> None:
     if not asn or _state.get("report_asn") == asn:
         return
@@ -646,15 +652,20 @@ def find_existing_report(page: Page, payee: dict, invoices: list):
         asn, code, row = match.groups()
         if payee_name not in row:
             continue
-        detail = _fetch_ntu_html(page, f"appshow.asp?sn={asn}").upper()
-        if all(number in detail for number in numbers):
-            return {"asn": asn, "code": code, "has_payment": "匯代墊人" in detail}
+        detail = _fetch_ntu_html(page, f"appshow.asp?sn={asn}")
+        if all(number in detail.upper() for number in numbers):
+            return {"asn": asn, "code": code, "complete": report_is_complete(detail)}
     return None
 
 
 def resume_existing_report(page: Page, report: dict) -> str:
     """Print a report that already exists in NTU instead of filing a new one."""
     asn = report["asn"]
+    if not report_is_complete(_fetch_ntu_html(page, f"appshow.asp?sn={asn}")):
+        raise NonRetryableSubmissionError(
+            f"NTU 報帳單 {report.get('code') or asn} 尚未完成（單據小計與付款小計不符或缺少受款人）。"
+            "為避免重複報帳，請先在報帳系統修改或刪除該報帳單後再重試。"
+        )
     page.goto(f"{NTU_APPLY_URL}/appshow.asp?sn={asn}", wait_until="domcontentloaded")
     remember_created_report(page, asn, report.get("code", ""))
     result = print_receipt(page)
@@ -1077,7 +1088,7 @@ def run_submission(
             log_event(case_id, "agent.resume", "started", source="session")
         else:
             report = find_existing_report(page, payee, invoices)
-            if report and not report["has_payment"]:
+            if report and not report["complete"]:
                 log_event(case_id, "agent.resume", "failed", reason="unfinished_duplicate")
                 raise NonRetryableSubmissionError(
                     f"NTU 已有相同受款人與發票的未完成報帳單 {report['code']}。"
