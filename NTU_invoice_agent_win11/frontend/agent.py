@@ -12,6 +12,7 @@ import platform
 import threading
 from openai import OpenAI
 from playwright.sync_api import sync_playwright, Page
+from banks import branch_name, payee_bank_error
 from diagnostics import error_details, log_event
 
 def _safe_accept(dialog):
@@ -464,18 +465,16 @@ def add_payee(page: Page, payee_id: str, note: str, amount: str, payee: dict = N
                         if form.count() == 0 or id_input.count() == 0:
                             continue
 
+                        # NTU stores the 7-digit branch code and its short
+                        # branch name (e.g. 8080624 / 玉山台大).
                         bank_code = str(payee.get("bank_code", "")).strip()
                         account_number = str(payee.get("account_number", "")).strip()
-                        bank_name_map = {
-                            "008": "華南商業銀行",
-                            "808": "玉山商業銀行",
-                            "7000021": "郵政存簿儲金",
-                        }
-                        bank_name = bank_name_map.get(bank_code, "")
+                        bank_name = branch_name(bank_code)
                         if not bank_name:
-                            return f"ERROR: 不支援的銀行代碼: {bank_code}"
-                        if bank_code == "7000021" and not re.fullmatch(r"\d{14}", account_number):
-                            return "ERROR: 郵局存款帳號必須為 14 碼數字。"
+                            return f"ERROR: 不支援的銀行分行代碼: {bank_code}"
+                        bank_error = payee_bank_error(bank_code, account_number)
+                        if bank_error:
+                            return f"ERROR: {bank_error}"
 
                         id_input.first.fill(str(payee.get("payee_id", "")).strip())
                         frame.locator("input[name='MNAME']").first.fill(

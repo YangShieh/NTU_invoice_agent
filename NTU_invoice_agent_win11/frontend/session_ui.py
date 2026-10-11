@@ -17,6 +17,7 @@ from fastapi.responses import HTMLResponse, Response
 import inspect
 import uvicorn, json, os, shutil, requests, time, subprocess
 from pydantic import BaseModel
+from banks import BANK_DATA, payee_bank_error
 from diagnostics import error_details, log_event, new_case_id
 
 SESSION_FILE = "session.json"   # wiped after confirmation
@@ -177,12 +178,23 @@ def save_payee(p: PayeeInfo):
     session = load_session()
     case_id = ensure_case_id(session)
     ensure_editable_before_agent(session, case_id)
-    session["payee"] = p.model_dump()
+    payee = p.model_dump()
+    payee = {key: str(value).strip() for key, value in payee.items()}
+    payee["payee_id"] = payee["payee_id"].upper()
+    bank_error = payee_bank_error(payee["bank_code"], payee["account_number"])
+    if bank_error:
+        log_event(case_id, "session.payee", "failed", reason="invalid_bank_account")
+        raise HTTPException(400, f"{bank_error}（案件 ID: {case_id}）")
+    session["payee"] = payee
     # Editing personal data must not discard already-confirmed invoices.
     session["step"] = "invoice_confirmed" if session.get("invoices") else "payee_saved"
     save_session(session)
     log_event(case_id, "session.payee", "completed")
     return {"ok": True}
+
+@app.get("/api/bank-branches")
+def bank_branches():
+    return BANK_DATA
 
 @app.post("/api/upload")
 async def upload_image(file: UploadFile = File(...)):
@@ -627,13 +639,17 @@ textarea{resize:vertical;min-height:50px}
     <div><label>身分證字號 *</label><input id="p-id" placeholder="F123456789" autocomplete="off"></div>
     <div><label>姓名 *</label><input id="p-name" placeholder="王小明" autocomplete="off"></div>
     <div class="full"><label>銀行名稱 / 代碼 *</label>
-      <select id="p-bcode">
+      <select id="p-bcode" onchange="onBankChange()">
         <option value="008">華南 (008)</option>
         <option value="808">玉山 (808)</option>
-        <option value="7000021">郵局 (7000021)</option>
+        <option value="700">郵局 (7000021)</option>
       </select>
     </div>
-    <div class="full"><label>存款帳號 *</label><input id="p-acct" placeholder="00012345678" autocomplete="off"></div>
+    <div class="full"><label>存款帳號 *</label><input id="p-acct" placeholder="00012345678" autocomplete="off" oninput="guessBranch()"></div>
+    <div class="full" id="branch-row"><label>分行 *（依帳號自動帶入，請確認）</label>
+      <select id="p-branch" onchange="branchTouched = true"></select>
+      <div id="branch-hint" style="font-size:11px;color:#888;margin-top:3px"></div>
+    </div>
   </div>
   <div class="btn-row">
     <button class="btn btn-primary" onclick="savePayee()">儲存並繼續</button>
@@ -760,17 +776,68 @@ function lockInputsForAgent() {
   });
 }
 
+let bankData = {};
+let branchTouched = false;
+
+async function loadBanks() {
+  try {
+    const res = await fetch('/api/bank-branches');
+    const data = await res.json();
+    (data.banks || []).forEach(bank => { bankData[bank.code] = bank; });
+  } catch (err) {
+    console.error('Unable to load bank branches:', err);
+  }
+  onBankChange();
+}
+
+function onBankChange() {
+  const bank = bankData[document.getElementById('p-bcode').value];
+  const select = document.getElementById('p-branch');
+  select.innerHTML = '';
+  if (!bank) return;
+  const multi = bank.branches.length > 1;
+  if (multi) {
+    const empty = document.createElement('option');
+    empty.value = '';
+    empty.textContent = '請選擇分行';
+    select.appendChild(empty);
+  }
+  bank.branches.forEach(([code, name]) => {
+    const option = document.createElement('option');
+    option.value = code;
+    option.textContent = `${name} (${code})`;
+    select.appendChild(option);
+  });
+  document.getElementById('branch-row').style.display = multi ? 'block' : 'none';
+  branchTouched = false;
+  guessBranch();
+}
+
+function guessBranch() {
+  const bank = bankData[document.getElementById('p-bcode').value];
+  const hint = document.getElementById('branch-hint');
+  hint.textContent = '';
+  if (!bank || !bank.branch_prefix_digits || branchTouched) return;
+  const account = document.getElementById('p-acct').value.trim();
+  const digits = bank.branch_prefix_digits;
+  if (account.length < digits) return;
+  const prefix = account.slice(0, digits);
+  const match = bank.branches.find(([code]) => code.slice(3, 3 + digits) === prefix);
+  document.getElementById('p-branch').value = match ? match[0] : '';
+  hint.textContent = match
+    ? '已依帳號前幾碼帶入分行，若與存摺不同請改選。'
+    : '無法依帳號判斷分行，請依存摺選擇。';
+}
+
 async function savePayee() {
   const body = {
     payee_id: document.getElementById('p-id').value.trim(),
     payee_name: document.getElementById('p-name').value.trim(),
-    bank_code: document.getElementById('p-bcode').value.trim(),
-
+    bank_code: document.getElementById('p-branch').value.trim(),
     account_number: document.getElementById('p-acct').value.trim(),
-
   };
   if (!body.payee_id || !body.payee_name || !body.bank_code || !body.account_number) {
-    setMsg('msg-payee', '請填寫所有必填欄位', 'err'); return;
+    setMsg('msg-payee', '請填寫所有必填欄位（含分行）', 'err'); return;
   }
   const res = await fetch('/api/payee', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
   if (res.ok) {
@@ -779,7 +846,9 @@ async function savePayee() {
     unlock('card-upload');
     if (currentInvoices.length) document.getElementById('btn-run-agent').disabled = false;
   } else {
-    setMsg('msg-payee', '儲存失敗', 'err');
+    let detail = '';
+    try { detail = (await res.json()).detail || ''; } catch (err) {}
+    setMsg('msg-payee', '儲存失敗' + (detail ? '：' + detail : ''), 'err');
   }
 }
 
@@ -1223,6 +1292,7 @@ async function restoreSessionState() {
   }
 }
 
+loadBanks();
 restoreSessionState();
 </script>
 </body>
